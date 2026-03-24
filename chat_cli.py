@@ -63,6 +63,7 @@ class AppConfig:
     api_version: str | None
     search_endpoint: str | None
     search_api_key: str | None
+    search_api_version: str
     search_index_name: str | None
     search_semantic_configuration: str | None
     search_query_type: str
@@ -74,6 +75,7 @@ class AppConfig:
     mcp_base_url: str | None
     mcp_timeout_seconds: int
     mcp_default_headers: dict[str, str]
+    debug_chat_messages: bool
 
 
 @dataclass
@@ -209,6 +211,24 @@ def _to_account_endpoint(endpoint: str) -> str:
     return endpoint.rstrip("/")
 
 
+def _resolve_search_endpoint(endpoint: str | None, service_name: str | None) -> str | None:
+    """Resolve Azure AI Search endpoint from explicit endpoint or service name.
+
+    This mirrors the behavior in testseach.py where service name maps to:
+    https://<service>.search.windows.net
+    """
+
+    if endpoint and service_name:
+        raise ValueError(
+            "Set either AZURE_AI_SEARCH_ENDPOINT or AZURE_AI_SEARCH_SERVICE_NAME, not both."
+        )
+    if endpoint:
+        return endpoint.rstrip("/")
+    if service_name:
+        return f"https://{service_name}.search.windows.net"
+    return None
+
+
 def load_config() -> AppConfig:
     """Load and validate application settings from environment variables.
 
@@ -221,7 +241,10 @@ def load_config() -> AppConfig:
 
     load_dotenv(override=False)
 
-    search_endpoint = _optional_env("AZURE_AI_SEARCH_ENDPOINT")
+    search_endpoint = _resolve_search_endpoint(
+        _optional_env("AZURE_AI_SEARCH_ENDPOINT"),
+        _optional_env("AZURE_AI_SEARCH_SERVICE_NAME"),
+    )
     search_index_name = _optional_env("AZURE_AI_SEARCH_INDEX_NAME")
     mcp_openapi_spec_url = _optional_env("MCP_OPENAPI_SPEC_URL")
     mcp_base_url = _optional_env("MCP_BASE_URL")
@@ -234,7 +257,8 @@ def load_config() -> AppConfig:
 
     if bool(search_endpoint) != bool(search_index_name):
         raise ValueError(
-            "Set both AZURE_AI_SEARCH_ENDPOINT and AZURE_AI_SEARCH_INDEX_NAME "
+            "Set AZURE_AI_SEARCH_INDEX_NAME and one of "
+            "AZURE_AI_SEARCH_ENDPOINT/AZURE_AI_SEARCH_SERVICE_NAME "
             "to enable Azure AI Search grounding."
         )
 
@@ -247,6 +271,7 @@ def load_config() -> AppConfig:
             api_version=_api_version_env("AZURE_OPENAI_API_VERSION", "2024-10-21"),
             search_endpoint=search_endpoint,
             search_api_key=_optional_env("AZURE_AI_SEARCH_API_KEY"),
+            search_api_version=_api_version_env("AZURE_AI_SEARCH_API_VERSION", "2024-07-01"),
             search_index_name=search_index_name,
             search_semantic_configuration=_optional_env("AZURE_AI_SEARCH_SEMANTIC_CONFIGURATION"),
             search_query_type=os.getenv("AZURE_AI_SEARCH_QUERY_TYPE", "semantic").strip().lower(),
@@ -258,6 +283,7 @@ def load_config() -> AppConfig:
             mcp_base_url=mcp_base_url,
             mcp_timeout_seconds=mcp_timeout_seconds,
             mcp_default_headers=mcp_default_headers,
+            debug_chat_messages=_bool_env("DEBUG_CHAT_MESSAGES", False),
         )
 
     # Foundry project endpoints are OpenAI-compatible for chat deployments.
@@ -269,6 +295,7 @@ def load_config() -> AppConfig:
         api_version=_api_version_env("FOUNDRY_API_VERSION", "2024-10-21"),
         search_endpoint=search_endpoint,
         search_api_key=_optional_env("AZURE_AI_SEARCH_API_KEY"),
+        search_api_version=_api_version_env("AZURE_AI_SEARCH_API_VERSION", "2024-07-01"),
         search_index_name=search_index_name,
         search_semantic_configuration=_optional_env("AZURE_AI_SEARCH_SEMANTIC_CONFIGURATION"),
         search_query_type=os.getenv("AZURE_AI_SEARCH_QUERY_TYPE", "semantic").strip().lower(),
@@ -280,7 +307,29 @@ def load_config() -> AppConfig:
         mcp_base_url=mcp_base_url,
         mcp_timeout_seconds=mcp_timeout_seconds,
         mcp_default_headers=mcp_default_headers,
+        debug_chat_messages=_bool_env("DEBUG_CHAT_MESSAGES", False),
     )
+
+
+def _render_chat_history_for_debug(history: ChatHistory) -> list[dict[str, str]]:
+    """Convert chat history to a compact role/content list for debug logging."""
+
+    rendered: list[dict[str, str]] = []
+    for message in history.messages:
+        role_value = getattr(message, "role", "unknown")
+        role = str(role_value)
+
+        content_value = getattr(message, "content", None)
+        if isinstance(content_value, str):
+            content = content_value
+        elif content_value is None:
+            content = ""
+        else:
+            content = str(content_value)
+
+        rendered.append({"role": role, "content": content})
+
+    return rendered
 
 
 def _normalize_tool_name(method: str, path: str) -> str:
@@ -962,6 +1011,114 @@ def build_search_data_source(config: AppConfig) -> dict[str, object] | None:
     return {"type": "azure_search", "parameters": parameters}
 
 
+def _extract_search_doc_text(document: object) -> str:
+    """Best-effort conversion of a search document into compact grounding text."""
+
+    if not isinstance(document, dict):
+        return str(document)
+
+    preferred_fields = [
+        "content",
+        "text",
+        "chunk",
+        "chunkText",
+        "summary",
+        "description",
+        "title",
+    ]
+    for field in preferred_fields:
+        value = document.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    snippets: list[str] = []
+    for key, value in document.items():
+        if key.startswith("@"):
+            continue
+        if isinstance(value, str) and value.strip():
+            snippets.append(f"{key}: {value.strip()}")
+        if len(snippets) >= 3:
+            break
+    return " | ".join(snippets) if snippets else json.dumps(document, ensure_ascii=True)
+
+
+def _format_search_context_for_message(
+    search_data_source: dict[str, object],
+    query: str,
+    documents: list[dict[str, object]],
+) -> str:
+    """Build a message-level grounding payload from Azure AI Search results."""
+
+    context_docs: list[dict[str, object]] = []
+    for idx, document in enumerate(documents, start=1):
+        context_docs.append(
+            {
+                "rank": idx,
+                "score": document.get("@search.score"),
+                "reranker_score": document.get("@search.rerankerScore"),
+                "content": _extract_search_doc_text(document),
+            }
+        )
+
+    payload = {
+        "datasources": [
+            {
+                "source": search_data_source,
+                "query": query,
+                "documents": context_docs,
+            }
+        ]
+    }
+
+    return (
+        "Use this grounding data if relevant and cite its facts conservatively.\n"
+        "Grounding payload (message-level, not request-level):\n"
+        f"{json.dumps(payload, ensure_ascii=True)}"
+    )
+
+
+async def _search_documents(
+    config: AppConfig,
+    user_query: str,
+) -> list[dict[str, object]]:
+    """Query Azure AI Search directly and return documents for grounding."""
+
+    if not config.search_endpoint or not config.search_index_name:
+        return []
+
+    url = (
+        f"{config.search_endpoint.rstrip('/')}/indexes/"
+        f"{quote(config.search_index_name, safe='')}/docs/search"
+        f"?api-version={quote(config.search_api_version, safe='')}"
+    )
+
+    payload: dict[str, object] = {
+        "search": user_query,
+        "top": config.search_top_n_documents,
+    }
+
+    if config.search_query_type in {"semantic", "simple", "full"}:
+        payload["queryType"] = config.search_query_type
+    if config.search_query_type == "semantic" and config.search_semantic_configuration:
+        payload["semanticConfiguration"] = config.search_semantic_configuration
+
+    headers = {"Content-Type": "application/json"}
+    if config.search_api_key:
+        headers["api-key"] = config.search_api_key
+    else:
+        credential = DefaultAzureCredential()
+        token = credential.get_token("https://search.azure.com/.default")
+        headers["Authorization"] = f"Bearer {token.token}"
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        body = response.json()
+
+    values = body.get("value", []) if isinstance(body, dict) else []
+    return [item for item in values if isinstance(item, dict)]
+
+
 def create_chat_service(config: AppConfig) -> ChatCompletionClientBase:
     """Create an AzureChatCompletion service for the selected provider mode.
 
@@ -1038,11 +1195,7 @@ async def run_chat() -> None:
 
     settings = AzureChatPromptExecutionSettings(temperature=0.7)
     search_data_source = build_search_data_source(config)
-    search_grounding_active = False
-    if search_data_source:
-        # Azure OpenAI/Foundry "On Your Data" payload.
-        settings.extra_body = {"data_sources": [search_data_source]}
-        search_grounding_active = True
+    search_grounding_active = bool(search_data_source)
 
     # mcp_interface powers manual slash commands; mcp_auto_plugin_enabled tracks
     # whether SK automatic function-calling is active for normal chat turns.
@@ -1082,17 +1235,6 @@ async def run_chat() -> None:
                 filters={"included_plugins": ["mcp"]},
             )
             mcp_auto_plugin_enabled = True
-
-            # Compatibility guard:
-            # Current endpoint behavior can reject request payloads when OYD
-            # grounding and automatic function-calling are both enabled.
-            if search_grounding_active:
-                settings.extra_body = None
-                search_grounding_active = False
-                print(
-                    "MCP init: Azure AI Search grounding disabled because it is "
-                    "currently incompatible with automatic MCP tool-calling."
-                )
         except Exception as exc:  # noqa: BLE001
             print(f"MCP init error: {exc}")
 
@@ -1207,16 +1349,38 @@ async def run_chat() -> None:
                 print(f"mcp> [error] {exc}\n")
                 continue
 
-            history.add_user_message(user_message_for_model)
-
-            if search_grounding_active:
-                print(
-                    "debug> search: enabled "
-                    f"query={json.dumps(user_text)} "
-                    f"index={config.search_index_name}"
-                )
+            user_message_text = user_text
+            if search_grounding_active and search_data_source is not None:
+                try:
+                    documents = await _search_documents(config, user_text)
+                    if documents:
+                        context_payload = _format_search_context_for_message(
+                            search_data_source=search_data_source,
+                            query=user_text,
+                            documents=documents,
+                        )
+                        user_message_text = f"{user_text}\n\n{context_payload}"
+                        print(
+                            "debug> search: enabled "
+                            f"query={json.dumps(user_text)} index={config.search_index_name} "
+                            f"hits={len(documents)}"
+                        )
+                    else:
+                        print(
+                            "debug> search: enabled "
+                            f"query={json.dumps(user_text)} index={config.search_index_name} hits=0"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"debug> search: failed error={exc}")
             else:
                 print("debug> search: disabled")
+
+            history.add_user_message(user_message_text)
+
+            if config.debug_chat_messages:
+                debug_messages = _render_chat_history_for_debug(history)
+                print("debug> azure-openai request messages:")
+                print(json.dumps(debug_messages, ensure_ascii=True, indent=2))
 
             try:
                 response = await chat_service.get_chat_message_content(
