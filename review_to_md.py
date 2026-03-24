@@ -43,12 +43,12 @@ from chat_cli import (
 
 
 REQUIREMENT_QUERY_LIMIT = 8
-FULL_DIRECTIVE_SECOND_PASS_MAX_CHUNKS = 4
-FULL_DIRECTIVE_SECOND_PASS_CHUNK_SIZE = 2200
-FULL_DIRECTIVE_SECOND_PASS_CHUNK_OVERLAP = 300
-THIRD_PASS_MAX_FILES = 20
-THIRD_PASS_FULL_TEXT_MAX_CHARS = 16000
-THIRD_PASS_FULL_TEXT_MIN_CHARS = 500
+STAGE2_FULL_DIRECTIVE_MAX_CHUNKS = 4
+STAGE2_FULL_DIRECTIVE_CHUNK_SIZE = 2200
+STAGE2_FULL_DIRECTIVE_CHUNK_OVERLAP = 300
+STAGE3_MAX_FILES = 20
+STAGE3_FULL_TEXT_MAX_CHARS = 16000
+STAGE3_FULL_TEXT_MIN_CHARS = 500
 
 
 def _log_stage(stage_number: int, message: str) -> None:
@@ -108,9 +108,9 @@ async def _download_pdf_bytes(source_ref: str) -> bytes:
     return await asyncio.to_thread(_download_with_identity)
 
 
-async def _load_full_document_text_for_pass3(
+async def _load_full_document_text_for_stage3(
     source_ref: str | None,
-    max_chars: int = THIRD_PASS_FULL_TEXT_MAX_CHARS,
+    max_chars: int = STAGE3_FULL_TEXT_MAX_CHARS,
 ) -> tuple[str | None, str | None]:
     if not source_ref:
         return None, "No source reference available in search metadata."
@@ -122,7 +122,7 @@ async def _load_full_document_text_for_pass3(
         return None, f"Full document fetch failed: {exc}"
 
     normalized = re.sub(r"\s+", " ", full_text).strip()
-    if len(normalized) < THIRD_PASS_FULL_TEXT_MIN_CHARS:
+    if len(normalized) < STAGE3_FULL_TEXT_MIN_CHARS:
         return None, "Full document text was empty or too short after extraction."
 
     return normalized[:max_chars], None
@@ -234,9 +234,9 @@ def _format_atomic_requirements_markdown(
 
 def _build_full_directive_chunks(
     directive_text: str,
-    max_chunks: int = FULL_DIRECTIVE_SECOND_PASS_MAX_CHUNKS,
-    chunk_size: int = FULL_DIRECTIVE_SECOND_PASS_CHUNK_SIZE,
-    overlap: int = FULL_DIRECTIVE_SECOND_PASS_CHUNK_OVERLAP,
+    max_chunks: int = STAGE2_FULL_DIRECTIVE_MAX_CHUNKS,
+    chunk_size: int = STAGE2_FULL_DIRECTIVE_CHUNK_SIZE,
+    overlap: int = STAGE2_FULL_DIRECTIVE_CHUNK_OVERLAP,
 ) -> list[tuple[str, str]]:
     cleaned = re.sub(r"\s+", " ", directive_text).strip()
     if not cleaned:
@@ -313,7 +313,7 @@ def _collect_affected_netl_files(
     return sorted(item for item in affected if item)
 
 
-async def _run_file_compliance_third_pass(
+async def _run_file_compliance_stage3(
     config,
     directive_text: str,
     requirements_for_retrieval: list[str],
@@ -326,12 +326,12 @@ async def _run_file_compliance_third_pass(
     requirement_seed = " ".join(requirements_for_retrieval[:3])
     directive_seed = _truncate_for_prompt(directive_text, max_chars=600)
     results: list[dict[str, object]] = []
-    files_to_check = affected_files[:THIRD_PASS_MAX_FILES]
+    files_to_check = affected_files[:STAGE3_MAX_FILES]
     _log_stage(3, "Per-file compliance scan")
 
     for file_name in tqdm(
         files_to_check,
-        desc="Pass 3: checking files",
+        desc="Stage 3: checking files",
         unit="file",
     ):
         query_text = _truncate_for_prompt(
@@ -398,7 +398,7 @@ async def _run_file_compliance_third_pass(
                 None,
             )
             _log_stage(3, f"{file_name}: source_ref={'present' if source_ref else 'missing'}")
-            full_document_text, full_document_error = await _load_full_document_text_for_pass3(
+            full_document_text, full_document_error = await _load_full_document_text_for_stage3(
                 source_ref
             )
             if full_document_text:
@@ -441,7 +441,7 @@ async def _run_file_compliance_third_pass(
                 None,
             )
             _log_stage(3, f"{file_name}: source_ref={'present' if source_ref else 'missing'}")
-            full_document_text, full_document_error = await _load_full_document_text_for_pass3(
+            full_document_text, full_document_error = await _load_full_document_text_for_stage3(
                 source_ref
             )
             if full_document_text:
@@ -466,14 +466,14 @@ async def _run_file_compliance_third_pass(
     return results
 
 
-def _build_pass3_snippet_evidence_summary(
-    file_compliance_third_pass: list[dict[str, object]],
+def _build_stage3_snippet_evidence_summary(
+    stage3_file_compliance: list[dict[str, object]],
 ) -> str:
-    if not file_compliance_third_pass:
-        return "No third-pass snippet evidence available."
+    if not stage3_file_compliance:
+        return "No Stage 3 snippet evidence available."
 
-    lines: list[str] = ["## Third-pass snippet evidence by file"]
-    for result in file_compliance_third_pass:
+    lines: list[str] = ["## Stage 3 snippet evidence by file"]
+    for result in stage3_file_compliance:
         file_name = str(result.get("file_name", ""))
         if not file_name:
             continue
@@ -510,8 +510,8 @@ def _format_requirement_search_context_for_message(
     dual_index_enabled: bool,
     orders_index_name: str | None,
     procedures_index_name: str | None,
-    supplemental_full_directive_results: list[dict[str, object]] | None = None,
-    file_compliance_third_pass: list[dict[str, object]] | None = None,
+    stage2_full_directive_results: list[dict[str, object]] | None = None,
+    stage3_file_compliance: list[dict[str, object]] | None = None,
 ) -> str:
     documents_to_investigate: list[str] = []
     payload_requirements: list[dict[str, object]] = []
@@ -606,8 +606,8 @@ def _format_requirement_search_context_for_message(
     docs_block = "\n".join(deduped_docs) if deduped_docs else "- (no matching documents found)"
 
     supplemental_payload: list[dict[str, object]] = []
-    if supplemental_full_directive_results:
-        for result in supplemental_full_directive_results:
+    if stage2_full_directive_results:
+        for result in stage2_full_directive_results:
             query_id = result["query_id"]
             query_text = result["query"]
             if dual_index_enabled:
@@ -680,9 +680,9 @@ def _format_requirement_search_context_for_message(
                     }
                 )
 
-    third_pass_payload: list[dict[str, object]] = []
-    if file_compliance_third_pass:
-        for result in file_compliance_third_pass:
+    stage3_payload: list[dict[str, object]] = []
+    if stage3_file_compliance:
+        for result in stage3_file_compliance:
             file_name = result["file_name"]
             query_text = result["query"]
 
@@ -711,7 +711,7 @@ def _format_requirement_search_context_for_message(
                         }
                     )
 
-                third_pass_payload.append(
+                stage3_payload.append(
                     {
                         "file_name": file_name,
                         "query": query_text,
@@ -745,7 +745,7 @@ def _format_requirement_search_context_for_message(
                         }
                     )
 
-                third_pass_payload.append(
+                stage3_payload.append(
                     {
                         "file_name": file_name,
                         "query": query_text,
@@ -761,15 +761,15 @@ def _format_requirement_search_context_for_message(
 
     payload = {
         "requirements": payload_requirements,
-        "full_directive_second_pass": supplemental_payload,
-        "file_compliance_third_pass": third_pass_payload,
+        "stage2_full_directive": supplemental_payload,
+        "stage3_file_compliance": stage3_payload,
     }
 
     return (
         "Use this requirement-scoped retrieval context and cite facts conservatively.\n"
-        "Treat requirement-scoped evidence as primary. Use the full-directive second pass only to identify gaps or missing obligations not represented in requirement-scoped evidence.\n"
-        "Use file_compliance_third_pass to produce a file-centric compliance result.\n"
-        "For each NETL file in file_compliance_third_pass, provide a clear update evaluation grounded in retrieved evidence.\n"
+        "Treat requirement-scoped evidence as primary. Use Stage 2 full-directive retrieval only to identify gaps or missing obligations not represented in requirement-scoped evidence.\n"
+        "Use stage3_file_compliance to produce a file-centric compliance result.\n"
+        "For each NETL file in stage3_file_compliance, provide a clear update evaluation grounded in retrieved evidence.\n"
         "For each recommendation, reference the requirement ID (R#) and point to a NETL file section "
         "or a precise fallback string to search for in that file.\n"
         "Documents to investigate by requirement:\n"
@@ -779,7 +779,7 @@ def _format_requirement_search_context_for_message(
     )
 
 
-def _build_pass3_delta_user_message(
+def _build_stage3_delta_user_message(
     directive_name: str,
     baseline_report: str,
     requirements_message: str,
@@ -789,14 +789,14 @@ def _build_pass3_delta_user_message(
     return "\n\n".join(
         [
             f"### DOE DIRECTIVE INPUT: {directive_name}",
-            "Generate PASS-3 compliance updates only.",
-            "Use file_compliance_third_pass evidence as primary for this task.",
+            "Generate Stage 3 compliance updates only.",
+            "Use stage3_file_compliance evidence as primary for this task.",
             "When full_document_text is present for a file, use it as primary evidence for that file's description and update evaluation.",
             "If full_document_text is missing, explicitly state that full text was unavailable and base evaluation only on retrieved snippets.",
             "Do NOT repeat unchanged content from baseline report.",
-            "Include each NETL file represented in file_compliance_third_pass.",
-            "Use NETL files from the third-pass snippet evidence list below when available.",
-            "If the third-pass snippet evidence list is empty or sparse, use requirement/full-directive payload context.",
+            "Include each NETL file represented in stage3_file_compliance.",
+            "Use NETL files from the Stage 3 snippet evidence list below when available.",
+            "If the Stage 3 snippet evidence list is empty or sparse, use requirement/full-directive payload context.",
             "For each NETL file, output this shape:",
             "### <NETL file name> (<Order|Procedure>)\\n#### Overall document description\\n<2-4 sentence summary of what the document governs>\\n#### Update evaluation\\n- Update needed: <Yes|No|Unclear>\\n- Rationale: <brief reason tied to directive requirements>",
             "Section 3 is optional and only include it when Update needed = Yes:",
@@ -808,8 +808,8 @@ def _build_pass3_delta_user_message(
             "Only add rows for snippets that actually exist in retrieved evidence; if none exist, omit section 4 for that file.",
             "Do not use placeholder text such as 'Search:' in table cells.",
             "Also include an Evidence confidence line (High/Medium/Low) per file.",
-            "If no files are available in third-pass evidence, output exactly: 'No pass-3 files identified.'",
-            "## Baseline report from pass 1/2",
+            "If no files are available in Stage 3 evidence, output exactly: 'No Stage 3 files identified.'",
+            "## Baseline report from Stage 1/2",
             baseline_report,
             requirements_message,
             context_payload,
@@ -868,10 +868,10 @@ async def _generate_report(
         requirements_for_retrieval
     )
     context_payload = ""
-    file_compliance_third_pass: list[dict[str, object]] = []
+    stage3_file_compliance: list[dict[str, object]] = []
 
     if _dual_index_retrieval_enabled(config):
-        _log_stage(1, "Atomic requirement retrieval (targeted pass)")
+        _log_stage(1, "Atomic requirement retrieval (targeted stage)")
         requirement_query_results: list[dict[str, object]] = []
         for idx, requirement in enumerate(requirements_for_retrieval, start=1):
             requirement_query = _truncate_for_prompt(requirement, max_chars=800)
@@ -895,8 +895,8 @@ async def _generate_report(
                 }
             )
 
-        _log_stage(2, "Full-directive chunk retrieval (recall pass)")
-        supplemental_full_directive_results: list[dict[str, object]] = []
+        _log_stage(2, "Full-directive chunk retrieval (recall stage)")
+        stage2_full_directive_results: list[dict[str, object]] = []
         for query_id, chunk in _build_full_directive_chunks(directive_text):
             query_text = _truncate_for_prompt(chunk, max_chars=1200)
             orders_documents = await _search_documents(
@@ -909,7 +909,7 @@ async def _generate_report(
                 query_text,
                 index_name=config.search_procedures_index_name,
             )
-            supplemental_full_directive_results.append(
+            stage2_full_directive_results.append(
                 {
                     "query_id": query_id,
                     "query": query_text,
@@ -920,10 +920,10 @@ async def _generate_report(
 
         affected_files = _collect_affected_netl_files(
             query_results=requirement_query_results,
-            supplemental_full_directive_results=supplemental_full_directive_results,
+            supplemental_full_directive_results=stage2_full_directive_results,
             dual_index_enabled=True,
         )
-        file_compliance_third_pass = await _run_file_compliance_third_pass(
+        stage3_file_compliance = await _run_file_compliance_stage3(
             config=config,
             directive_text=directive_text,
             requirements_for_retrieval=requirements_for_retrieval,
@@ -938,14 +938,14 @@ async def _generate_report(
             dual_index_enabled=True,
             orders_index_name=config.search_orders_index_name,
             procedures_index_name=config.search_procedures_index_name,
-            supplemental_full_directive_results=supplemental_full_directive_results,
-            file_compliance_third_pass=file_compliance_third_pass,
+            stage2_full_directive_results=stage2_full_directive_results,
+            stage3_file_compliance=stage3_file_compliance,
         )
         history.add_user_message(
             f"{user_message}\n\n{requirements_message}\n\n{context_payload}"
         )
     elif search_data_source:
-        _log_stage(1, "Atomic requirement retrieval (targeted pass)")
+        _log_stage(1, "Atomic requirement retrieval (targeted stage)")
         requirement_query_results = []
         for idx, requirement in enumerate(requirements_for_retrieval, start=1):
             requirement_query = _truncate_for_prompt(requirement, max_chars=800)
@@ -959,12 +959,12 @@ async def _generate_report(
                 }
             )
 
-        _log_stage(2, "Full-directive chunk retrieval (recall pass)")
-        supplemental_full_directive_results = []
+        _log_stage(2, "Full-directive chunk retrieval (recall stage)")
+        stage2_full_directive_results = []
         for query_id, chunk in _build_full_directive_chunks(directive_text):
             query_text = _truncate_for_prompt(chunk, max_chars=1200)
             documents = await _search_documents(config, query_text)
-            supplemental_full_directive_results.append(
+            stage2_full_directive_results.append(
                 {
                     "query_id": query_id,
                     "query": query_text,
@@ -974,10 +974,10 @@ async def _generate_report(
 
         affected_files = _collect_affected_netl_files(
             query_results=requirement_query_results,
-            supplemental_full_directive_results=supplemental_full_directive_results,
+            supplemental_full_directive_results=stage2_full_directive_results,
             dual_index_enabled=False,
         )
-        file_compliance_third_pass = await _run_file_compliance_third_pass(
+        stage3_file_compliance = await _run_file_compliance_stage3(
             config=config,
             directive_text=directive_text,
             requirements_for_retrieval=requirements_for_retrieval,
@@ -992,15 +992,15 @@ async def _generate_report(
             dual_index_enabled=False,
             orders_index_name=None,
             procedures_index_name=None,
-            supplemental_full_directive_results=supplemental_full_directive_results,
-            file_compliance_third_pass=file_compliance_third_pass,
+            stage2_full_directive_results=stage2_full_directive_results,
+            stage3_file_compliance=stage3_file_compliance,
         )
         if requirement_query_results:
             history.add_user_message(f"{user_message}\n\n{context_payload}")
             history.add_user_message(
                 f"{requirements_message}\n\n"
                 "When no explicit section number is present in retrieved evidence, provide an exact search string the reviewer can use in the NETL file.\n"
-                "In the final report, include one subsection per NETL file under Proposed Document Updates (Pass-3 Seed), each containing a 'What needs to be updated' bullet list."
+                "In the final report, include one subsection per NETL file under Proposed Document Updates (Stage 3 Seed), each containing a 'What needs to be updated' bullet list."
             )
         else:
             history.add_user_message(user_message)
@@ -1017,13 +1017,13 @@ async def _generate_report(
     )
     report_text = str(response)
 
-    pass3_history = ChatHistory()
-    pass3_history.add_system_message(agent_prompt_config.prompt)
-    snippet_evidence_summary = _build_pass3_snippet_evidence_summary(
-        file_compliance_third_pass=file_compliance_third_pass,
+    stage3_history = ChatHistory()
+    stage3_history.add_system_message(agent_prompt_config.prompt)
+    snippet_evidence_summary = _build_stage3_snippet_evidence_summary(
+        stage3_file_compliance=stage3_file_compliance,
     )
-    pass3_history.add_user_message(
-        _build_pass3_delta_user_message(
+    stage3_history.add_user_message(
+        _build_stage3_delta_user_message(
             directive_name=directive_file.name,
             baseline_report=report_text,
             requirements_message=requirements_message,
@@ -1031,8 +1031,8 @@ async def _generate_report(
             snippet_evidence_summary=snippet_evidence_summary,
         )
     )
-    pass3_response = await chat_service.get_chat_message_content(
-        chat_history=pass3_history,
+    stage3_response = await chat_service.get_chat_message_content(
+        chat_history=stage3_history,
         settings=settings,
         kernel=kernel,
     )
@@ -1041,7 +1041,7 @@ async def _generate_report(
         directive_name=directive_file.name,
         requirements=atomic_requirements,
     )
-    return report_text, atomic_requirements, requirements_review_markdown, str(pass3_response)
+    return report_text, atomic_requirements, requirements_review_markdown, str(stage3_response)
 
 
 def _write_output(output_path: Path, content: str) -> None:
@@ -1092,7 +1092,7 @@ def _write_pdf_output(output_path: Path, content: str) -> None:
 def main() -> None:
     args = _parse_args()
 
-    report, _, requirements_review, pass3_report = asyncio.run(
+    report, _, requirements_review, stage3_report = asyncio.run(
         _generate_report(directive_path=args.directive)
     )
 
@@ -1103,20 +1103,20 @@ def main() -> None:
     markdown_output = output_path.resolve()
     pdf_output = markdown_output.with_suffix(".pdf")
     requirements_output = markdown_output.with_name(
-        f"{markdown_output.stem}_atomic_requirements.md"
+        f"{markdown_output.stem}_stage1_atomic_requirements.md"
     )
-    pass3_output = markdown_output.with_name(
-        f"{markdown_output.stem}_pass3_updates.md"
+    stage3_output = markdown_output.with_name(
+        f"{markdown_output.stem}_stage3_updates.md"
     )
 
     _write_output(markdown_output, report)
     _write_pdf_output(pdf_output, report)
     _write_output(requirements_output, requirements_review)
-    _write_output(pass3_output, pass3_report)
+    _write_output(stage3_output, stage3_report)
     print(f"Investigation markdown report written to: {markdown_output}")
     print(f"Investigation PDF report written to: {pdf_output}")
     print(f"Atomic requirements review written to: {requirements_output}")
-    print(f"Pass-3 compliance updates written to: {pass3_output}")
+    print(f"Stage 3 compliance updates written to: {stage3_output}")
 
 
 if __name__ == "__main__":
