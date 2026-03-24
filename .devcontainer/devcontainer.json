@@ -45,6 +45,6 @@
     ],
     "postCreateCommand": "",
     "hostRequirements": {
-        "memory": "8gb"
+        "memory": "5gb"
     }
 }
