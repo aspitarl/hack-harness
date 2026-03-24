@@ -25,7 +25,7 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urljoin, urlparse
+from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
@@ -65,6 +65,8 @@ class AppConfig:
     search_api_key: str | None
     search_api_version: str
     search_index_name: str | None
+    search_orders_index_name: str | None
+    search_procedures_index_name: str | None
     search_semantic_configuration: str | None
     search_query_type: str
     search_in_scope: bool
@@ -79,19 +81,10 @@ class AppConfig:
 
 
 @dataclass
-class AgentPromptExample:
-    """Single few-shot example pair from the agent YAML configuration."""
-
-    question: str
-    answer: str
-
-
-@dataclass
 class AgentPromptConfig:
-    """System prompt plus optional few-shot examples for chat initialization."""
+    """System prompt for chat initialization."""
 
     prompt: str
-    examples: list[AgentPromptExample]
 
 
 @dataclass
@@ -246,6 +239,8 @@ def load_config() -> AppConfig:
         _optional_env("AZURE_AI_SEARCH_SERVICE_NAME"),
     )
     search_index_name = _optional_env("AZURE_AI_SEARCH_INDEX_NAME")
+    search_orders_index_name = _optional_env("AZURE_AI_SEARCH_ORDERS_INDEX_NAME")
+    search_procedures_index_name = _optional_env("AZURE_AI_SEARCH_PROCEDURES_INDEX_NAME")
     mcp_openapi_spec_url = _optional_env("MCP_OPENAPI_SPEC_URL")
     mcp_base_url = _optional_env("MCP_BASE_URL")
     mcp_timeout_seconds = _int_env("MCP_TIMEOUT_SECONDS", 30)
@@ -255,11 +250,28 @@ def load_config() -> AppConfig:
     if provider not in {"azure_openai", "foundry"}:
         raise ValueError("CHAT_PROVIDER must be either 'azure_openai' or 'foundry'.")
 
-    if bool(search_endpoint) != bool(search_index_name):
+    if bool(search_orders_index_name) != bool(search_procedures_index_name):
         raise ValueError(
-            "Set AZURE_AI_SEARCH_INDEX_NAME and one of "
-            "AZURE_AI_SEARCH_ENDPOINT/AZURE_AI_SEARCH_SERVICE_NAME "
-            "to enable Azure AI Search grounding."
+            "Set both AZURE_AI_SEARCH_ORDERS_INDEX_NAME and "
+            "AZURE_AI_SEARCH_PROCEDURES_INDEX_NAME for dual-index retrieval."
+        )
+
+    single_index_mode = bool(search_index_name)
+    dual_index_mode = bool(search_orders_index_name and search_procedures_index_name)
+
+    if (single_index_mode or dual_index_mode) and not search_endpoint:
+        raise ValueError(
+            "Set one of AZURE_AI_SEARCH_ENDPOINT/AZURE_AI_SEARCH_SERVICE_NAME "
+            "when using AZURE_AI_SEARCH_INDEX_NAME or dual-index values "
+            "(AZURE_AI_SEARCH_ORDERS_INDEX_NAME and "
+            "AZURE_AI_SEARCH_PROCEDURES_INDEX_NAME)."
+        )
+
+    if search_endpoint and not (single_index_mode or dual_index_mode):
+        raise ValueError(
+            "Set AZURE_AI_SEARCH_INDEX_NAME for single-index mode, or set both "
+            "AZURE_AI_SEARCH_ORDERS_INDEX_NAME and "
+            "AZURE_AI_SEARCH_PROCEDURES_INDEX_NAME for dual-index mode."
         )
 
     if provider == "azure_openai":
@@ -273,6 +285,8 @@ def load_config() -> AppConfig:
             search_api_key=_optional_env("AZURE_AI_SEARCH_API_KEY"),
             search_api_version=_api_version_env("AZURE_AI_SEARCH_API_VERSION", "2024-07-01"),
             search_index_name=search_index_name,
+            search_orders_index_name=search_orders_index_name,
+            search_procedures_index_name=search_procedures_index_name,
             search_semantic_configuration=_optional_env("AZURE_AI_SEARCH_SEMANTIC_CONFIGURATION"),
             search_query_type=os.getenv("AZURE_AI_SEARCH_QUERY_TYPE", "semantic").strip().lower(),
             search_in_scope=_bool_env("AZURE_AI_SEARCH_IN_SCOPE", True),
@@ -297,6 +311,8 @@ def load_config() -> AppConfig:
         search_api_key=_optional_env("AZURE_AI_SEARCH_API_KEY"),
         search_api_version=_api_version_env("AZURE_AI_SEARCH_API_VERSION", "2024-07-01"),
         search_index_name=search_index_name,
+        search_orders_index_name=search_orders_index_name,
+        search_procedures_index_name=search_procedures_index_name,
         search_semantic_configuration=_optional_env("AZURE_AI_SEARCH_SEMANTIC_CONFIGURATION"),
         search_query_type=os.getenv("AZURE_AI_SEARCH_QUERY_TYPE", "semantic").strip().lower(),
         search_in_scope=_bool_env("AZURE_AI_SEARCH_IN_SCOPE", True),
@@ -799,13 +815,10 @@ def _handle_mcp_command(command_text: str, mcp: OpenAPIMCPInterface | None) -> b
 
 
 def load_agent_prompt_config(file_path: str) -> AgentPromptConfig:
-    """Load and validate agent system prompt + few-shot examples from YAML.
+    """Load and validate agent system prompt from YAML.
 
     Expected shape:
         prompt: <string>
-        example:
-          - question: <string>
-            answer: <string>
     """
 
     path = Path(file_path)
@@ -819,57 +832,35 @@ def load_agent_prompt_config(file_path: str) -> AgentPromptConfig:
     if not prompt:
         raise ValueError(f"Agent prompt config must include a non-empty 'prompt': {file_path}")
 
-    raw_examples = data.get("example", [])
-    if raw_examples is None:
-        raw_examples = []
-    if not isinstance(raw_examples, list):
-        raise ValueError(f"'example' must be a list in agent prompt config: {file_path}")
-
-    examples: list[AgentPromptExample] = []
-    for idx, item in enumerate(raw_examples, start=1):
-        if not isinstance(item, dict):
-            raise ValueError(f"example[{idx}] must be an object in agent prompt config: {file_path}")
-
-        question = str(item.get("question", "")).strip()
-        answer = str(item.get("answer", "")).strip()
-
-        if not question or not answer:
-            raise ValueError(
-                f"example[{idx}] must include non-empty 'question' and 'answer' in {file_path}"
-            )
-
-        examples.append(AgentPromptExample(question=question, answer=answer))
-
-    return AgentPromptConfig(prompt=prompt, examples=examples)
+    return AgentPromptConfig(prompt=prompt)
 
 
-def _format_review_help() -> str:
-    """Return CLI help text for DOE directive review command."""
+def _format_investigate_help() -> str:
+    """Return CLI help text for directive impact investigation command."""
 
     return (
-        "Review command:\n"
-        "  /review --requirements <requirements.pdf> --draft <draft-file> [--draft <draft-file> ...]\n"
+        "Investigate command:\n"
+        "  /investigate --directive <new-directive-file>\n"
         "Notes:\n"
         "  - Quote paths that contain spaces.\n"
-        "  - Supported draft file types: .pdf, .txt, .md\n"
-        "Examples:\n"
-        '  /review --requirements "/pdfs/DOE_Directives.pdf" --draft "/pdfs/P251-1-01_DirectivesProcessing.pdf"\n'
-        '  /review --requirements "/pdfs/DOE_Directives.pdf" --draft "/pdfs/P251-1-01_DirectivesProcessing.pdf" --draft "/pdfs/O251_1_DirectivesProgram.pdf"\n'
+        "  - Supported file types: .pdf, .txt, .md\n"
+        "Example:\n"
+        '  /investigate --directive "pdfs/new_directive.pdf"\n'
     )
 
 
-def _parse_review_command(command_text: str) -> dict[str, object] | None:
-    """Parse /review command arguments.
+def _parse_investigate_command(command_text: str) -> dict[str, object] | None:
+    """Parse /investigate command arguments.
 
     Returns:
-        None if the input is not a /review command.
+        None if the input is not an /investigate command.
         A dictionary with one of:
             {"help": True}
             {"error": "..."}
-            {"requirements": str, "drafts": list[str]}
+            {"directive": str}
     """
 
-    if not command_text.startswith("/review"):
+    if not command_text.startswith("/investigate"):
         return None
 
     try:
@@ -880,32 +871,48 @@ def _parse_review_command(command_text: str) -> dict[str, object] | None:
     if len(tokens) == 1 or tokens[1] in {"help", "--help", "-h"}:
         return {"help": True}
 
-    requirements_path: str | None = None
-    draft_paths: list[str] = []
+    directive_path: str | None = None
 
     index = 1
     while index < len(tokens):
         token = tokens[index]
-        if token == "--requirements":
+        if token == "--directive":
             if index + 1 >= len(tokens):
-                return {"error": "Missing value for --requirements."}
-            requirements_path = tokens[index + 1]
-            index += 2
-            continue
-        if token == "--draft":
-            if index + 1 >= len(tokens):
-                return {"error": "Missing value for --draft."}
-            draft_paths.append(tokens[index + 1])
+                return {"error": "Missing value for --directive."}
+            directive_path = tokens[index + 1]
             index += 2
             continue
         return {"error": f"Unknown option: {token}"}
 
-    if not requirements_path:
-        return {"error": "--requirements is required."}
-    if not draft_paths:
-        return {"error": "At least one --draft file is required."}
+    if not directive_path:
+        return {"error": "--directive is required."}
 
-    return {"requirements": requirements_path, "drafts": draft_paths}
+    return {"directive": directive_path}
+
+
+def _build_investigate_user_message(directive_name: str, directive_text: str) -> str:
+    """Build a model prompt for directive impact investigation across documents."""
+
+    return "\n\n".join(
+        [
+            "Identify which existing NETL procedure and NETL order documents likely need updates based on this DOE directive.",
+            "Return markdown in this section order:",
+            "## Investigation Summary\n## Key Files to Investigate\n## Key Sections to Update\n## Recommended Updates\n## Uncertainty and Follow-ups",
+            "In 'Key Sections to Update', include specific excerpted passages from NETL orders/procedures that indicate likely impact.",
+            "In 'Investigation Summary', clearly state: DOE directive input analyzed against NETL orders/procedures.",
+            f"### DOE DIRECTIVE INPUT: {directive_name}",
+            directive_text,
+        ]
+    )
+
+
+def _query_preview(text: str, max_chars: int = 160) -> str:
+    """Return a compact single-line preview for debug logging."""
+
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[:max_chars] + "..."
 
 
 def _resolve_existing_file(path_value: str, label: str) -> Path:
@@ -952,33 +959,6 @@ def _truncate_for_prompt(text: str, max_chars: int = 60000) -> str:
     return (
         text[:max_chars]
         + "\n\n[TRUNCATED: document exceeded prompt size limit; review based on available content.]"
-    )
-
-
-def _build_review_user_message(requirements_text: str, drafts: list[tuple[str, str]]) -> str:
-    """Build a structured review request payload for the assistant."""
-
-    draft_blocks: list[str] = []
-    for name, content in drafts:
-        draft_blocks.append(
-            "\n".join(
-                [
-                    f"### DRAFT DOCUMENT: {name}",
-                    content,
-                ]
-            )
-        )
-
-    return "\n\n".join(
-        [
-            "Perform a DOE directive compliance review using the provided requirements and draft directive document(s).",
-            "The requirements may include obligations for both procedure and order drafts. Evaluate each draft individually and also cross-document consistency when more than one draft is provided.",
-            "### REQUIREMENTS DOCUMENT",
-            requirements_text,
-            *draft_blocks,
-            "### REVIEW INSTRUCTIONS",
-            "Return feedback in markdown with the required section headings and specific, actionable rewrite guidance.",
-        ]
     )
 
 
@@ -1077,18 +1057,142 @@ def _format_search_context_for_message(
     )
 
 
+def _dual_index_retrieval_enabled(config: AppConfig) -> bool:
+    """Return True when both orders/procedures indexes are configured."""
+
+    return bool(config.search_orders_index_name and config.search_procedures_index_name)
+
+
+def _extract_search_doc_name(document: dict[str, object], fallback_rank: int) -> str:
+    """Best-effort extraction of a stable, human-readable document identifier."""
+
+    def _normalize(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        raw = value.strip()
+        if not raw:
+            return None
+
+        parsed = urlparse(raw)
+        if parsed.scheme and (parsed.netloc or parsed.path):
+            candidate = unquote((parsed.path or "").rstrip("/"))
+            if candidate:
+                name = Path(candidate).name
+                return name or candidate
+
+        if "/" in raw or "\\" in raw:
+            trimmed = raw.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+            candidate = unquote(trimmed)
+            if candidate:
+                name = Path(candidate).name
+                return name or candidate
+
+        return raw
+
+    path_like_fields = [
+        "metadata_storage_name",
+        "metadata_storage_path",
+        "blob_url",
+        "blobUrl",
+        "sourcefile",
+        "sourceFile",
+        "source_file",
+        "fileName",
+        "filename",
+        "file_name",
+        "path",
+        "url",
+        "uri",
+        "metadata_storage_url",
+    ]
+    for field in path_like_fields:
+        normalized = _normalize(document.get(field))
+        if normalized:
+            return normalized
+
+    fallback_fields = ["title", "uid", "snippet_parent_id", "id", "chunk_id", "key"]
+    for field in fallback_fields:
+        normalized = _normalize(document.get(field))
+        if normalized:
+            return normalized
+
+    return f"document_{fallback_rank}"
+
+
+def _format_dual_search_context_for_message(
+    query: str,
+    orders_index_name: str,
+    procedures_index_name: str,
+    orders_documents: list[dict[str, object]],
+    procedures_documents: list[dict[str, object]],
+) -> str:
+    """Build a merged retrieval payload from orders+procedures indexes."""
+
+    def _to_context_docs(
+        docs: list[dict[str, object]],
+        doc_type: str,
+    ) -> list[dict[str, object]]:
+        context_docs: list[dict[str, object]] = []
+        for idx, document in enumerate(docs, start=1):
+            context_docs.append(
+                {
+                    "doc_type": doc_type,
+                    "rank": idx,
+                    "document": _extract_search_doc_name(document, idx),
+                    "score": document.get("@search.score"),
+                    "reranker_score": document.get("@search.rerankerScore"),
+                    "content": _extract_search_doc_text(document),
+                }
+            )
+        return context_docs
+
+    orders_context = _to_context_docs(orders_documents, "NETL order")
+    procedures_context = _to_context_docs(procedures_documents, "NETL procedure")
+    merged_context = orders_context + procedures_context
+
+    investigation_candidates: list[str] = []
+    for item in merged_context:
+        investigation_candidates.append(
+            f"- [{item['doc_type']}] {item['document']}"
+        )
+
+    payload = {
+        "query": query,
+        "sources": [
+            {"index": orders_index_name, "doc_type": "order", "documents": orders_context},
+            {
+                "index": procedures_index_name,
+                "doc_type": "procedure",
+                "documents": procedures_context,
+            },
+        ],
+    }
+
+    investigation_section = "\n".join(investigation_candidates) or "- (no matching documents found)"
+    return (
+        "Use this retrieval context if relevant and cite facts conservatively.\n"
+        "When relevant, start your answer with a 'Documents to Investigate' list using the candidates below.\n"
+        "Documents to investigate:\n"
+        f"{investigation_section}\n\n"
+        "Grounding payload (message-level, not request-level):\n"
+        f"{json.dumps(payload, ensure_ascii=True)}"
+    )
+
+
 async def _search_documents(
     config: AppConfig,
     user_query: str,
+    index_name: str | None = None,
 ) -> list[dict[str, object]]:
     """Query Azure AI Search directly and return documents for grounding."""
 
-    if not config.search_endpoint or not config.search_index_name:
+    effective_index_name = index_name or config.search_index_name
+    if not config.search_endpoint or not effective_index_name:
         return []
 
     url = (
         f"{config.search_endpoint.rstrip('/')}/indexes/"
-        f"{quote(config.search_index_name, safe='')}/docs/search"
+        f"{quote(effective_index_name, safe='')}/docs/search"
         f"?api-version={quote(config.search_api_version, safe='')}"
     )
 
@@ -1185,17 +1289,14 @@ async def run_chat() -> None:
     kernel = Kernel()
     chat_service = create_chat_service(config)
     kernel.add_service(chat_service)
-    # Seed history with system prompt and optional few-shot examples to shape
-    # assistant behavior before user interaction starts.
+    # Seed history with system prompt before user interaction starts.
     history = ChatHistory()
     history.add_system_message(agent_prompt_config.prompt)
-    for example in agent_prompt_config.examples:
-        history.add_user_message(example.question)
-        history.add_assistant_message(example.answer)
 
-    settings = AzureChatPromptExecutionSettings(temperature=0.7)
+    settings = AzureChatPromptExecutionSettings()
     search_data_source = build_search_data_source(config)
-    search_grounding_active = bool(search_data_source)
+    dual_index_search_active = _dual_index_retrieval_enabled(config)
+    search_grounding_active = bool(search_data_source) or dual_index_search_active
 
     # mcp_interface powers manual slash commands; mcp_auto_plugin_enabled tracks
     # whether SK automatic function-calling is active for normal chat turns.
@@ -1260,13 +1361,17 @@ async def run_chat() -> None:
         print("Auth mode: API key")
     else:
         print("Auth mode: Azure Default Credential")
-    if search_grounding_active:
+    if dual_index_search_active:
+        print(
+            "Grounding: Azure AI Search dual-index enabled "
+            f"(orders: {config.search_orders_index_name}, "
+            f"procedures: {config.search_procedures_index_name})"
+        )
+    elif search_data_source is not None:
         print(f"Grounding: Azure AI Search enabled (index: {config.search_index_name})")
     else:
         print("Grounding: disabled")
     print(f"Agent prompt config: {config.agent_prompt_file}")
-    if agent_prompt_config.examples:
-        print(f"Agent examples loaded: {len(agent_prompt_config.examples)}")
     if mcp_interface:
         print(f"MCP: enabled ({len(mcp_interface.list_tools())} tools from OpenAPI)")
         print("MCP commands: /mcp tools, /mcp call <tool_name> <json-args>, /mcp reload")
@@ -1278,6 +1383,7 @@ async def run_chat() -> None:
         print("MCP: disabled due to initialization error")
     else:
         print("MCP: disabled")
+    print("Investigation command: /investigate --directive <new-directive-file>")
     print("Press Ctrl+X or Ctrl+C to exit.\n")
 
     with patch_stdout():
@@ -1297,46 +1403,39 @@ async def run_chat() -> None:
                 continue
 
             user_message_for_model = user_text
+            search_query_text = user_text
 
             try:
-                review_request = _parse_review_command(user_text)
-                if review_request is not None:
-                    if review_request.get("help"):
-                        print(_format_review_help())
+                investigate_request = _parse_investigate_command(user_text)
+                if investigate_request is not None:
+                    if investigate_request.get("help"):
+                        print(_format_investigate_help())
                         print()
                         continue
 
-                    if "error" in review_request:
-                        print(f"review> {review_request['error']}")
-                        print(_format_review_help())
+                    if "error" in investigate_request:
+                        print(f"investigate> {investigate_request['error']}")
+                        print(_format_investigate_help())
                         print()
                         continue
 
-                    requirements_path = _resolve_existing_file(
-                        str(review_request["requirements"]),
-                        "Requirements",
+                    directive_path = _resolve_existing_file(
+                        str(investigate_request["directive"]),
+                        "Directive",
                     )
-
-                    requirements_text = _truncate_for_prompt(
-                        _load_review_document(requirements_path)
+                    directive_text = _truncate_for_prompt(_load_review_document(directive_path))
+                    user_message_for_model = _build_investigate_user_message(
+                        directive_name=directive_path.name,
+                        directive_text=directive_text,
                     )
-
-                    draft_docs: list[tuple[str, str]] = []
-                    for raw_draft_path in review_request["drafts"]:
-                        draft_path = _resolve_existing_file(str(raw_draft_path), "Draft")
-                        draft_text = _truncate_for_prompt(_load_review_document(draft_path))
-                        draft_docs.append((draft_path.name, draft_text))
-
-                    user_message_for_model = _build_review_user_message(
-                        requirements_text=requirements_text,
-                        drafts=draft_docs,
-                    )
+                    search_query_text = _truncate_for_prompt(directive_text, max_chars=8000)
                     print(
-                        "review> Loaded requirements and "
-                        f"{len(draft_docs)} draft file(s) for DOE review."
+                        "investigate> Loaded directive file for impact analysis: "
+                        f"{directive_path.name}"
                     )
+
             except Exception as exc:  # noqa: BLE001
-                print(f"review> [error] {exc}")
+                print(f"investigate> [error] {exc}")
                 print()
                 continue
 
@@ -1349,26 +1448,59 @@ async def run_chat() -> None:
                 print(f"mcp> [error] {exc}\n")
                 continue
 
-            user_message_text = user_text
-            if search_grounding_active and search_data_source is not None:
+            user_message_text = user_message_for_model
+            if dual_index_search_active:
                 try:
-                    documents = await _search_documents(config, user_text)
+                    orders_documents = await _search_documents(
+                        config,
+                        search_query_text,
+                        index_name=config.search_orders_index_name,
+                    )
+                    procedures_documents = await _search_documents(
+                        config,
+                        search_query_text,
+                        index_name=config.search_procedures_index_name,
+                    )
+
+                    context_payload = _format_dual_search_context_for_message(
+                        query=search_query_text,
+                        orders_index_name=str(config.search_orders_index_name),
+                        procedures_index_name=str(config.search_procedures_index_name),
+                        orders_documents=orders_documents,
+                        procedures_documents=procedures_documents,
+                    )
+                    user_message_text = f"{user_message_for_model}\n\n{context_payload}"
+                    print(
+                        "debug> search: enabled dual-index "
+                        f"query_preview={json.dumps(_query_preview(search_query_text))} "
+                        f"orders_index={config.search_orders_index_name} "
+                        f"orders_hits={len(orders_documents)} "
+                        f"procedures_index={config.search_procedures_index_name} "
+                        f"procedures_hits={len(procedures_documents)}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"debug> search: failed dual-index error={exc}")
+            elif search_data_source is not None:
+                try:
+                    documents = await _search_documents(config, search_query_text)
                     if documents:
                         context_payload = _format_search_context_for_message(
                             search_data_source=search_data_source,
-                            query=user_text,
+                            query=search_query_text,
                             documents=documents,
                         )
-                        user_message_text = f"{user_text}\n\n{context_payload}"
+                        user_message_text = f"{user_message_for_model}\n\n{context_payload}"
                         print(
                             "debug> search: enabled "
-                            f"query={json.dumps(user_text)} index={config.search_index_name} "
+                            f"query_preview={json.dumps(_query_preview(search_query_text))} "
+                            f"index={config.search_index_name} "
                             f"hits={len(documents)}"
                         )
                     else:
                         print(
                             "debug> search: enabled "
-                            f"query={json.dumps(user_text)} index={config.search_index_name} hits=0"
+                            f"query_preview={json.dumps(_query_preview(search_query_text))} "
+                            f"index={config.search_index_name} hits=0"
                         )
                 except Exception as exc:  # noqa: BLE001
                     print(f"debug> search: failed error={exc}")

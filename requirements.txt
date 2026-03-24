@@ -5,3 +5,4 @@ azure-identity>=1.17.1
 PyYAML>=6.0.2
 pypdf>=4.2.0
 azure-search-documents>=11.6.0
+reportlab>=4.2.2

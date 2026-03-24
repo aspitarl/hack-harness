@@ -9,7 +9,7 @@ A Python command-line chat harness built with Semantic Kernel.
 	- Azure OpenAI endpoint
 	- Foundry project endpoint with chat deployment
 - Optional MCP-like tool interface backed by a published OpenAPI 3.x spec.
-- Includes a DOE directive review command for comparing requirements and draft directive files.
+- Includes a DOE new-directive investigation command for identifying orders/procedures that likely need updates.
 - Exits on `Ctrl+C` or `Ctrl+X`.
 
 ## Files
@@ -31,7 +31,7 @@ pip install -r requirements.txt
 
 ### Agent Prompt Configuration
 
-This project loads a system prompt and optional few-shot examples from an agent config file in `agents/`.
+This project loads a system prompt from an agent config file in `agents/`.
 
 ```env
 AGENT_PROMPT_FILE=agents/default.yaml
@@ -42,63 +42,57 @@ Expected YAML shape:
 ```yaml
 prompt: |
 	You are a helpful assistant...
-
-example:
-	- question: First user message
-		answer: First assistant response
-	- question: Second user message
-		answer: Second assistant response
 ```
 
-The `prompt` is added as a system message at startup, and each `example` pair is added to chat history before interactive input begins.
+The `prompt` is added as a system message at startup.
 
-### DOE Directive Review Command
+### DOE New-Directive Investigation Command
 
 Inside the interactive prompt, run:
 
 ```text
-/review --requirements <requirements.pdf> --draft <draft-file> [--draft <draft-file> ...]
+/investigate --directive <new-directive-file>
 ```
 
 Supported file types:
 
-- Requirements: `.pdf`, `.txt`, `.md`
-- Drafts: `.pdf`, `.txt`, `.md`
+- Directive: `.pdf`, `.txt`, `.md`
 
 For paths with spaces, wrap each path in quotes.
 
 Example with your current files:
 
 ```text
-/review --requirements "/pdfs/DOE_Directives.pdf" --draft "/pdfs/P251-1-01_DirectivesProcessing.pdf" --draft "/pdfs/O251_1_DirectivesProgram.pdf"
+/investigate --directive "pdfs/new_directive.pdf"
 ```
 
-The command loads document text, sends a structured review request to the model, and returns a markdown report with:
+The command loads directive text, searches procedures and orders from Azure AI Search, and returns a markdown investigation report.
 
-- Executive summary
-- Requirement-by-requirement findings
-- Gaps and risks
-- Suggested revisions
-- Priority next steps
+- Investigation summary
+- Key files to investigate
+- Key sections to update
+- Recommended updates
+- Uncertainty and follow-ups
 
 Notes:
 
 - Very large documents are truncated before prompt submission.
-- Scanned PDFs without embedded text require OCR before review.
+- Scanned PDFs without embedded text require OCR before analysis.
 
-### One-shot Review to Markdown File
+### One-shot Investigation to Markdown + PDF
 
-Use this non-interactive script to run one review and save directly to a markdown file:
+Use this non-interactive script to run one investigation and save markdown output.
+It also generates a PDF with the same base filename at the end.
 
 ```bash
 python3 review_to_md.py \
-	--requirements "pdfs/DOE_Directives.pdf" \
-	--draft "pdfs/P251-1-01_DirectivesProcessing.pdf" \
-	--draft "pdfs/O251_1_DirectivesProgram.pdf" \
-	--out "reports/doe_review.md"
+	--directive "pdfs/new_directive.pdf" \
+	--out "reports/new_directive_investigation.md"
 ```
 
-The script prints the output file path after writing the report.
+The script writes:
+- `reports/new_directive_investigation.md`
+- `reports/new_directive_investigation.pdf`
 
 ### Option A: Azure OpenAI
 
@@ -132,6 +126,17 @@ Set both of these values to enable grounding:
 AZURE_AI_SEARCH_ENDPOINT=https://<your-search-service>.search.windows.net
 AZURE_AI_SEARCH_INDEX_NAME=<your-index-name>
 ```
+
+Dual-index mode (orders + procedures):
+
+```env
+AZURE_AI_SEARCH_ENDPOINT=https://<your-search-service>.search.windows.net
+AZURE_AI_SEARCH_ORDERS_INDEX_NAME=<orders-index-name>
+AZURE_AI_SEARCH_PROCEDURES_INDEX_NAME=<procedures-index-name>
+```
+
+In dual-index mode, the CLI runs one search per index, merges results, and sends a
+"Documents to investigate" candidate list to the model.
 
 Authentication for Search:
 
