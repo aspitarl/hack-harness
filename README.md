@@ -27,6 +27,29 @@ pip install -r requirements.txt
 
 3. Edit `.env`.
 
+### Agent Prompt Configuration
+
+This project loads a system prompt and optional few-shot examples from an agent config file in `agents/`.
+
+```env
+AGENT_PROMPT_FILE=agents/default.yaml
+```
+
+Expected YAML shape:
+
+```yaml
+prompt: |
+	You are a helpful assistant...
+
+example:
+	- question: First user message
+		answer: First assistant response
+	- question: Second user message
+		answer: Second assistant response
+```
+
+The `prompt` is added as a system message at startup, and each `example` pair is added to chat history before interactive input begins.
+
 ### Option A: Azure OpenAI
 
 ```env

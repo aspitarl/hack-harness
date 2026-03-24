@@ -2,3 +2,4 @@ semantic-kernel>=1.20.0
 python-dotenv>=1.0.1
 prompt_toolkit>=3.0.47
 azure-identity>=1.17.1
+PyYAML>=6.0.2

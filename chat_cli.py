@@ -1,6 +1,7 @@
 import asyncio
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
@@ -12,6 +13,7 @@ from semantic_kernel import Kernel
 from semantic_kernel.connectors.ai.chat_completion_client_base import ChatCompletionClientBase
 from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion, AzureChatPromptExecutionSettings
 from semantic_kernel.contents.chat_history import ChatHistory
+import yaml
 
 
 @dataclass
@@ -29,6 +31,19 @@ class AppConfig:
     search_in_scope: bool
     search_strictness: int
     search_top_n_documents: int
+    agent_prompt_file: str
+
+
+@dataclass
+class AgentPromptExample:
+    question: str
+    answer: str
+
+
+@dataclass
+class AgentPromptConfig:
+    prompt: str
+    examples: list[AgentPromptExample]
 
 
 def _required_env(name: str) -> str:
@@ -112,6 +127,7 @@ def load_config() -> AppConfig:
             search_in_scope=_bool_env("AZURE_AI_SEARCH_IN_SCOPE", True),
             search_strictness=_int_env("AZURE_AI_SEARCH_STRICTNESS", 3),
             search_top_n_documents=_int_env("AZURE_AI_SEARCH_TOP_N_DOCUMENTS", 5),
+            agent_prompt_file=os.getenv("AGENT_PROMPT_FILE", "agents/default.yaml").strip(),
         )
 
     # Foundry project endpoints are OpenAI-compatible for chat deployments.
@@ -129,7 +145,44 @@ def load_config() -> AppConfig:
         search_in_scope=_bool_env("AZURE_AI_SEARCH_IN_SCOPE", True),
         search_strictness=_int_env("AZURE_AI_SEARCH_STRICTNESS", 3),
         search_top_n_documents=_int_env("AZURE_AI_SEARCH_TOP_N_DOCUMENTS", 5),
+        agent_prompt_file=os.getenv("AGENT_PROMPT_FILE", "agents/default.yaml").strip(),
     )
+
+
+def load_agent_prompt_config(file_path: str) -> AgentPromptConfig:
+    path = Path(file_path)
+    if not path.exists():
+        raise ValueError(f"Agent prompt config file not found: {file_path}")
+
+    with path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+
+    prompt = str(data.get("prompt", "")).strip()
+    if not prompt:
+        raise ValueError(f"Agent prompt config must include a non-empty 'prompt': {file_path}")
+
+    raw_examples = data.get("example", [])
+    if raw_examples is None:
+        raw_examples = []
+    if not isinstance(raw_examples, list):
+        raise ValueError(f"'example' must be a list in agent prompt config: {file_path}")
+
+    examples: list[AgentPromptExample] = []
+    for idx, item in enumerate(raw_examples, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"example[{idx}] must be an object in agent prompt config: {file_path}")
+
+        question = str(item.get("question", "")).strip()
+        answer = str(item.get("answer", "")).strip()
+
+        if not question or not answer:
+            raise ValueError(
+                f"example[{idx}] must include non-empty 'question' and 'answer' in {file_path}"
+            )
+
+        examples.append(AgentPromptExample(question=question, answer=answer))
+
+    return AgentPromptConfig(prompt=prompt, examples=examples)
 
 
 def build_search_data_source(config: AppConfig) -> dict[str, object] | None:
@@ -204,11 +257,17 @@ def create_chat_service(config: AppConfig) -> ChatCompletionClientBase:
 
 async def run_chat() -> None:
     config = load_config()
+    agent_prompt_config = load_agent_prompt_config(config.agent_prompt_file)
 
     kernel = Kernel()
     chat_service = create_chat_service(config)
     kernel.add_service(chat_service)
     history = ChatHistory()
+    history.add_system_message(agent_prompt_config.prompt)
+    for example in agent_prompt_config.examples:
+        history.add_user_message(example.question)
+        history.add_assistant_message(example.answer)
+
     settings = AzureChatPromptExecutionSettings(temperature=0.7)
     search_data_source = build_search_data_source(config)
     if search_data_source:
@@ -241,6 +300,9 @@ async def run_chat() -> None:
         print(f"Grounding: Azure AI Search enabled (index: {config.search_index_name})")
     else:
         print("Grounding: disabled")
+    print(f"Agent prompt config: {config.agent_prompt_file}")
+    if agent_prompt_config.examples:
+        print(f"Agent examples loaded: {len(agent_prompt_config.examples)}")
     print("Press Ctrl+X or Ctrl+C to exit.\n")
 
     with patch_stdout():
