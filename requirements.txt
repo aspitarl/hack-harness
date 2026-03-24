@@ -3,3 +3,4 @@ python-dotenv>=1.0.1
 prompt_toolkit>=3.0.47
 azure-identity>=1.17.1
 PyYAML>=6.0.2
+pypdf>=4.2.0

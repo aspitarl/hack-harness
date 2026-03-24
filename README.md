@@ -9,6 +9,7 @@ A Python command-line chat harness built with Semantic Kernel.
 	- Azure OpenAI endpoint
 	- Foundry project endpoint with chat deployment
 - Optional MCP-like tool interface backed by a published OpenAPI 3.x spec.
+- Includes a DOE directive review command for comparing requirements and draft directive files.
 - Exits on `Ctrl+C` or `Ctrl+X`.
 
 ## Files
@@ -50,6 +51,54 @@ example:
 ```
 
 The `prompt` is added as a system message at startup, and each `example` pair is added to chat history before interactive input begins.
+
+### DOE Directive Review Command
+
+Inside the interactive prompt, run:
+
+```text
+/review --requirements <requirements.pdf> --draft <draft-file> [--draft <draft-file> ...]
+```
+
+Supported file types:
+
+- Requirements: `.pdf`, `.txt`, `.md`
+- Drafts: `.pdf`, `.txt`, `.md`
+
+For paths with spaces, wrap each path in quotes.
+
+Example with your current files:
+
+```text
+/review --requirements "/pdfs/DOE_Directives.pdf" --draft "/pdfs/P251-1-01_DirectivesProcessing.pdf" --draft "/pdfs/O251_1_DirectivesProgram.pdf"
+```
+
+The command loads document text, sends a structured review request to the model, and returns a markdown report with:
+
+- Executive summary
+- Requirement-by-requirement findings
+- Gaps and risks
+- Suggested revisions
+- Priority next steps
+
+Notes:
+
+- Very large documents are truncated before prompt submission.
+- Scanned PDFs without embedded text require OCR before review.
+
+### One-shot Review to Markdown File
+
+Use this non-interactive script to run one review and save directly to a markdown file:
+
+```bash
+python3 review_to_md.py \
+	--requirements "pdfs/DOE_Directives.pdf" \
+	--draft "pdfs/P251-1-01_DirectivesProcessing.pdf" \
+	--draft "pdfs/O251_1_DirectivesProgram.pdf" \
+	--out "reports/doe_review.md"
+```
+
+The script prints the output file path after writing the report.
 
 ### Option A: Azure OpenAI
 

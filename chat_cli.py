@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -40,6 +41,8 @@ from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion, AzureChat
 from semantic_kernel.connectors.openapi_plugin import OpenAPIFunctionExecutionParameters
 from semantic_kernel.contents.chat_history import ChatHistory
 import yaml
+
+from utils.pdf_extractor import extract_pdf_text
 
 
 @dataclass
@@ -791,6 +794,145 @@ def load_agent_prompt_config(file_path: str) -> AgentPromptConfig:
     return AgentPromptConfig(prompt=prompt, examples=examples)
 
 
+def _format_review_help() -> str:
+    """Return CLI help text for DOE directive review command."""
+
+    return (
+        "Review command:\n"
+        "  /review --requirements <requirements.pdf> --draft <draft-file> [--draft <draft-file> ...]\n"
+        "Notes:\n"
+        "  - Quote paths that contain spaces.\n"
+        "  - Supported draft file types: .pdf, .txt, .md\n"
+        "Examples:\n"
+        '  /review --requirements "/pdfs/DOE_Directives.pdf" --draft "/pdfs/P251-1-01_DirectivesProcessing.pdf"\n'
+        '  /review --requirements "/pdfs/DOE_Directives.pdf" --draft "/pdfs/P251-1-01_DirectivesProcessing.pdf" --draft "/pdfs/O251_1_DirectivesProgram.pdf"\n'
+    )
+
+
+def _parse_review_command(command_text: str) -> dict[str, object] | None:
+    """Parse /review command arguments.
+
+    Returns:
+        None if the input is not a /review command.
+        A dictionary with one of:
+            {"help": True}
+            {"error": "..."}
+            {"requirements": str, "drafts": list[str]}
+    """
+
+    if not command_text.startswith("/review"):
+        return None
+
+    try:
+        tokens = shlex.split(command_text)
+    except ValueError as exc:
+        return {"error": f"Invalid command syntax: {exc}"}
+
+    if len(tokens) == 1 or tokens[1] in {"help", "--help", "-h"}:
+        return {"help": True}
+
+    requirements_path: str | None = None
+    draft_paths: list[str] = []
+
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--requirements":
+            if index + 1 >= len(tokens):
+                return {"error": "Missing value for --requirements."}
+            requirements_path = tokens[index + 1]
+            index += 2
+            continue
+        if token == "--draft":
+            if index + 1 >= len(tokens):
+                return {"error": "Missing value for --draft."}
+            draft_paths.append(tokens[index + 1])
+            index += 2
+            continue
+        return {"error": f"Unknown option: {token}"}
+
+    if not requirements_path:
+        return {"error": "--requirements is required."}
+    if not draft_paths:
+        return {"error": "At least one --draft file is required."}
+
+    return {"requirements": requirements_path, "drafts": draft_paths}
+
+
+def _resolve_existing_file(path_value: str, label: str) -> Path:
+    """Resolve and validate an existing file path from CLI input."""
+
+    candidate = Path(path_value).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    resolved = candidate.resolve()
+    if not resolved.exists() or not resolved.is_file():
+        raise ValueError(f"{label} file not found: {resolved}")
+    return resolved
+
+
+def _read_text_file(file_path: Path) -> str:
+    """Read a UTF-8 text file used as a draft document."""
+
+    try:
+        return file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"Unsupported text encoding for {file_path}. Please provide UTF-8 text."
+        ) from exc
+
+
+def _load_review_document(file_path: Path) -> str:
+    """Load review document content from PDF or plain text file."""
+
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        return extract_pdf_text(file_path)
+    if suffix in {".txt", ".md"}:
+        return _read_text_file(file_path)
+    raise ValueError(
+        f"Unsupported file type: {file_path.name}. Supported: .pdf, .txt, .md"
+    )
+
+
+def _truncate_for_prompt(text: str, max_chars: int = 60000) -> str:
+    """Limit very large document content before sending to the model."""
+
+    if len(text) <= max_chars:
+        return text
+    return (
+        text[:max_chars]
+        + "\n\n[TRUNCATED: document exceeded prompt size limit; review based on available content.]"
+    )
+
+
+def _build_review_user_message(requirements_text: str, drafts: list[tuple[str, str]]) -> str:
+    """Build a structured review request payload for the assistant."""
+
+    draft_blocks: list[str] = []
+    for name, content in drafts:
+        draft_blocks.append(
+            "\n".join(
+                [
+                    f"### DRAFT DOCUMENT: {name}",
+                    content,
+                ]
+            )
+        )
+
+    return "\n\n".join(
+        [
+            "Perform a DOE directive compliance review using the provided requirements and draft directive document(s).",
+            "The requirements may include obligations for both procedure and order drafts. Evaluate each draft individually and also cross-document consistency when more than one draft is provided.",
+            "### REQUIREMENTS DOCUMENT",
+            requirements_text,
+            *draft_blocks,
+            "### REVIEW INSTRUCTIONS",
+            "Return feedback in markdown with the required section headings and specific, actionable rewrite guidance.",
+        ]
+    )
+
+
 def build_search_data_source(config: AppConfig) -> dict[str, object] | None:
     """Build Azure AI Search data source payload for OYD chat requests.
 
@@ -1012,6 +1154,50 @@ async def run_chat() -> None:
             if not user_text:
                 continue
 
+            user_message_for_model = user_text
+
+            try:
+                review_request = _parse_review_command(user_text)
+                if review_request is not None:
+                    if review_request.get("help"):
+                        print(_format_review_help())
+                        print()
+                        continue
+
+                    if "error" in review_request:
+                        print(f"review> {review_request['error']}")
+                        print(_format_review_help())
+                        print()
+                        continue
+
+                    requirements_path = _resolve_existing_file(
+                        str(review_request["requirements"]),
+                        "Requirements",
+                    )
+
+                    requirements_text = _truncate_for_prompt(
+                        _load_review_document(requirements_path)
+                    )
+
+                    draft_docs: list[tuple[str, str]] = []
+                    for raw_draft_path in review_request["drafts"]:
+                        draft_path = _resolve_existing_file(str(raw_draft_path), "Draft")
+                        draft_text = _truncate_for_prompt(_load_review_document(draft_path))
+                        draft_docs.append((draft_path.name, draft_text))
+
+                    user_message_for_model = _build_review_user_message(
+                        requirements_text=requirements_text,
+                        drafts=draft_docs,
+                    )
+                    print(
+                        "review> Loaded requirements and "
+                        f"{len(draft_docs)} draft file(s) for DOE review."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(f"review> [error] {exc}")
+                print()
+                continue
+
             # Slash commands are processed before normal model turns.
             try:
                 if _handle_mcp_command(user_text, mcp_interface):
@@ -1021,7 +1207,7 @@ async def run_chat() -> None:
                 print(f"mcp> [error] {exc}\n")
                 continue
 
-            history.add_user_message(user_text)
+            history.add_user_message(user_message_for_model)
 
             if search_grounding_active:
                 print(
