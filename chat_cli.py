@@ -461,6 +461,10 @@ class OpenAPIMCPInterface:
             headers=request_headers,
             data=request_body,
         )
+        print(
+            "debug> mcp manual-call: "
+            f"tool={tool.name} method={tool.method.upper()} url={request_url}"
+        )
 
         # Execute HTTP call and normalize common network/HTTP failures.
         try:
@@ -468,8 +472,16 @@ class OpenAPIMCPInterface:
                 raw_body = response.read().decode("utf-8")
                 status = response.status
                 response_headers = dict(response.headers.items())
+                print(
+                    "debug> mcp manual-call result: "
+                    f"tool={tool.name} status={status}"
+                )
         except HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
+            print(
+                "debug> mcp manual-call result: "
+                f"tool={tool.name} status={exc.code}"
+            )
             raise RuntimeError(
                 f"MCP tool call failed: HTTP {exc.code} on {tool.method.upper()} {request_url}"
                 f"\n{error_body}"
@@ -574,6 +586,32 @@ def _format_mcp_help() -> str:
     )
 
 
+def _extract_mcp_request_details(kwargs: dict[str, object]) -> tuple[str, str, str]:
+    """Best-effort extraction of operation/method/url from OpenAPI callback kwargs."""
+
+    operation = str(
+        kwargs.get("operation_id")
+        or kwargs.get("operationId")
+        or kwargs.get("function_name")
+        or kwargs.get("functionName")
+        or "unknown_operation"
+    )
+    method = str(
+        kwargs.get("method")
+        or kwargs.get("http_method")
+        or kwargs.get("httpMethod")
+        or "UNKNOWN"
+    ).upper()
+    url = str(
+        kwargs.get("url")
+        or kwargs.get("request_url")
+        or kwargs.get("requestUrl")
+        or kwargs.get("uri")
+        or "unknown_url"
+    )
+    return operation, method, url
+
+
 def _build_openapi_auth_callback(default_headers: dict[str, str]):
     """Build auth callback used by Semantic Kernel OpenAPI plugin execution.
 
@@ -582,6 +620,10 @@ def _build_openapi_auth_callback(default_headers: dict[str, str]):
     """
 
     async def _auth_callback(**_kwargs) -> dict[str, str]:  # noqa: ANN003
+        operation, method, url = _extract_mcp_request_details(_kwargs)
+        print(
+            f"debug> mcp auto-call: operation={operation} method={method} url={url}"
+        )
         return dict(default_headers)
 
     return _auth_callback
@@ -917,6 +959,15 @@ async def run_chat() -> None:
                 continue
 
             history.add_user_message(user_text)
+
+            if search_grounding_active:
+                print(
+                    "debug> search: enabled "
+                    f"query={json.dumps(user_text)} "
+                    f"index={config.search_index_name}"
+                )
+            else:
+                print("debug> search: disabled")
 
             try:
                 response = await chat_service.get_chat_message_content(
