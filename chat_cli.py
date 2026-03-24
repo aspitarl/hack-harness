@@ -1,3 +1,22 @@
+"""Interactive Semantic Kernel chat CLI with optional MCP/OpenAPI tooling.
+
+This module is designed as both an executable chat client and a learning sample.
+It demonstrates how to combine:
+
+1. Azure OpenAI or Azure AI Foundry chat completions via Semantic Kernel.
+2. Optional Azure AI Search grounding ("On Your Data").
+3. Optional MCP-like tool integration from an OpenAPI 3.x document.
+4. Optional automatic tool invocation via Semantic Kernel function calling.
+
+High-level flow:
+
+1. Load runtime configuration from environment variables.
+2. Build the chat completion service (API key or managed identity auth).
+3. Build initial chat history from an agent prompt YAML file.
+4. Optionally register OpenAPI operations as Semantic Kernel plugin functions.
+5. Run an interactive REPL loop for user messages, slash commands, and replies.
+"""
+
 import asyncio
 import json
 import os
@@ -24,6 +43,15 @@ import yaml
 
 @dataclass
 class AppConfig:
+    """Runtime configuration loaded from .env/environment variables.
+
+    The fields are grouped around three concerns:
+
+    1. Chat provider settings (Azure OpenAI or Foundry).
+    2. Optional Azure AI Search grounding settings.
+    3. Optional MCP/OpenAPI tool settings.
+    """
+
     provider: str
     deployment_name: str
     endpoint: str
@@ -46,18 +74,24 @@ class AppConfig:
 
 @dataclass
 class AgentPromptExample:
+    """Single few-shot example pair from the agent YAML configuration."""
+
     question: str
     answer: str
 
 
 @dataclass
 class AgentPromptConfig:
+    """System prompt plus optional few-shot examples for chat initialization."""
+
     prompt: str
     examples: list[AgentPromptExample]
 
 
 @dataclass
 class OpenAPIParameter:
+    """Subset of OpenAPI parameter metadata used for tool invocation."""
+
     name: str
     location: str
     required: bool
@@ -66,6 +100,8 @@ class OpenAPIParameter:
 
 @dataclass
 class OpenAPITool:
+    """Parsed OpenAPI operation represented as a callable tool descriptor."""
+
     name: str
     description: str
     method: str
@@ -75,6 +111,12 @@ class OpenAPITool:
 
 
 def _required_env(name: str) -> str:
+    """Read and validate a required environment variable.
+
+    Raises:
+        ValueError: If the value is missing or empty after trimming whitespace.
+    """
+
     value = os.getenv(name, "").strip()
     if not value:
         raise ValueError(f"Missing required environment variable: {name}")
@@ -82,11 +124,15 @@ def _required_env(name: str) -> str:
 
 
 def _optional_env(name: str) -> str | None:
+    """Read an optional environment variable and normalize empty -> None."""
+
     value = os.getenv(name, "").strip()
     return value if value else None
 
 
 def _api_version_env(name: str, default: str) -> str:
+    """Read API version and map blank/v1 placeholder values to a default."""
+
     value = os.getenv(name, "").strip()
     if not value or value.lower() == "v1":
         return default
@@ -94,6 +140,8 @@ def _api_version_env(name: str, default: str) -> str:
 
 
 def _int_env(name: str, default: int) -> int:
+    """Read an integer environment variable with validation and fallback."""
+
     value = os.getenv(name, "").strip()
     if not value:
         return default
@@ -104,6 +152,12 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _json_object_env(name: str) -> dict[str, str]:
+    """Read a JSON object from environment and coerce keys/values to strings.
+
+    This helper is used for MCP default headers so callers can supply values like:
+    {"x-api-key":"..."} directly in .env.
+    """
+
     value = os.getenv(name, "").strip()
     if not value:
         return {}
@@ -123,6 +177,8 @@ def _json_object_env(name: str) -> dict[str, str]:
 
 
 def _bool_env(name: str, default: bool) -> bool:
+    """Read a boolean environment variable supporting common truthy/falsy tokens."""
+
     value = os.getenv(name, "").strip().lower()
     if not value:
         return default
@@ -137,6 +193,12 @@ def _bool_env(name: str, default: bool) -> bool:
 
 
 def _to_account_endpoint(endpoint: str) -> str:
+    """Reduce a URL to scheme + host, dropping any path/query/fragment.
+
+    Example:
+        https://host/api/projects/foo -> https://host
+    """
+
     parsed = urlparse(endpoint)
     if parsed.scheme and parsed.netloc:
         return f"{parsed.scheme}://{parsed.netloc}"
@@ -144,6 +206,15 @@ def _to_account_endpoint(endpoint: str) -> str:
 
 
 def load_config() -> AppConfig:
+    """Load and validate application settings from environment variables.
+
+    Returns:
+        AppConfig: Normalized runtime settings for chat, grounding, and MCP.
+
+    Raises:
+        ValueError: If provider is invalid or required environment values are missing.
+    """
+
     load_dotenv(override=False)
 
     search_endpoint = _optional_env("AZURE_AI_SEARCH_ENDPOINT")
@@ -209,11 +280,21 @@ def load_config() -> AppConfig:
 
 
 def _normalize_tool_name(method: str, path: str) -> str:
+    """Create a safe fallback tool name from HTTP method + path."""
+
     raw_name = f"{method}_{path}"
     return re.sub(r"[^a-zA-Z0-9_]", "_", raw_name).strip("_")
 
 
 def _load_openapi_document(spec_url: str, timeout_seconds: int) -> dict[str, object]:
+    """Download and parse an OpenAPI 3.x document from a URL.
+
+    The parser supports both JSON and YAML payloads.
+
+    Raises:
+        ValueError: If the document cannot be loaded, parsed, or is not OpenAPI 3.x.
+    """
+
     try:
         with urlopen(spec_url, timeout=timeout_seconds) as response:
             payload = response.read().decode("utf-8")
@@ -240,6 +321,14 @@ def _resolve_openapi_base_url(
     spec_url: str,
     base_url_override: str | None,
 ) -> str:
+    """Resolve the effective base URL for OpenAPI operation calls.
+
+    Resolution order:
+    1. MCP_BASE_URL override (if provided).
+    2. First non-localhost OpenAPI server URL.
+    3. Spec origin (scheme + host from spec URL).
+    """
+
     if base_url_override:
         return base_url_override.rstrip("/")
 
@@ -266,6 +355,17 @@ def _resolve_openapi_base_url(
 
 
 class OpenAPIMCPInterface:
+    """Simple MCP-like adapter around an OpenAPI specification.
+
+    Purpose:
+    - Expose OpenAPI operations as named tools.
+    - Execute tool calls using a tool-name + JSON-arguments shape.
+
+    Note:
+    This class is used for manual slash-command invocation (/mcp ...). Automatic
+    invocation is handled separately through Semantic Kernel plugin registration.
+    """
+
     def __init__(
         self,
         spec_url: str,
@@ -273,6 +373,8 @@ class OpenAPIMCPInterface:
         timeout_seconds: int,
         default_headers: dict[str, str],
     ) -> None:
+        """Initialize and load the OpenAPI tool catalog."""
+
         self.spec_url = spec_url
         self.base_url_override = base_url_override
         self.timeout_seconds = timeout_seconds
@@ -282,14 +384,29 @@ class OpenAPIMCPInterface:
         self.reload()
 
     def reload(self) -> None:
+        """Reload OpenAPI spec and refresh parsed tools/base URL."""
+
         spec = _load_openapi_document(self.spec_url, self.timeout_seconds)
         self.base_url = _resolve_openapi_base_url(spec, self.spec_url, self.base_url_override)
         self._tools = self._parse_tools(spec)
 
     def list_tools(self) -> list[OpenAPITool]:
+        """Return tools sorted by name for stable output and discoverability."""
+
         return sorted(self._tools.values(), key=lambda item: item.name)
 
     def call_tool(self, tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """Invoke a parsed tool with JSON-like arguments.
+
+        Args:
+            tool_name: OpenAPI operationId (or generated fallback name).
+            arguments: Dictionary containing path/query/header/cookie fields and
+                optional body payload under the key "body".
+
+        Returns:
+            Structured dictionary with request metadata and parsed response data.
+        """
+
         tool = self._tools.get(tool_name)
         if tool is None:
             available = ", ".join(sorted(self._tools.keys()))
@@ -300,6 +417,7 @@ class OpenAPIMCPInterface:
         request_headers: dict[str, str] = dict(self.default_headers)
         cookie_items: list[str] = []
 
+        # Convert user-supplied arguments into path/query/header/cookie inputs.
         for parameter in tool.parameters:
             value = arguments.get(parameter.name)
             if parameter.required and value is None:
@@ -328,6 +446,8 @@ class OpenAPIMCPInterface:
         if query_items:
             request_url = f"{request_url}?{urlencode(query_items)}"
 
+        # Request bodies are passed as arguments["body"] to avoid collisions
+        # with parameter names from the OpenAPI operation.
         request_body: bytes | None = None
         if "body" in arguments:
             request_body = json.dumps(arguments["body"]).encode("utf-8")
@@ -342,6 +462,7 @@ class OpenAPIMCPInterface:
             data=request_body,
         )
 
+        # Execute HTTP call and normalize common network/HTTP failures.
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 raw_body = response.read().decode("utf-8")
@@ -358,6 +479,7 @@ class OpenAPIMCPInterface:
                 f"MCP tool call failed: unable to reach {request_url}: {exc}"
             ) from exc
 
+        # Prefer JSON parsing, but keep raw text if the response is not JSON.
         try:
             parsed_body: object = json.loads(raw_body) if raw_body.strip() else {}
         except json.JSONDecodeError:
@@ -373,6 +495,8 @@ class OpenAPIMCPInterface:
         }
 
     def _parse_tools(self, spec: dict[str, object]) -> dict[str, OpenAPITool]:
+        """Extract callable operations from OpenAPI paths into tool descriptors."""
+
         paths = spec.get("paths", {})
         if not isinstance(paths, dict):
             raise ValueError("OpenAPI spec 'paths' must be an object.")
@@ -436,6 +560,8 @@ class OpenAPIMCPInterface:
 
 
 def _format_mcp_help() -> str:
+    """Return CLI help text for manual MCP slash commands."""
+
     return (
         "MCP commands:\n"
         "  /mcp tools\n"
@@ -449,6 +575,12 @@ def _format_mcp_help() -> str:
 
 
 def _build_openapi_auth_callback(default_headers: dict[str, str]):
+    """Build auth callback used by Semantic Kernel OpenAPI plugin execution.
+
+    SK's OpenAPI runner calls this callback before each request. Returning the
+    configured default headers allows simple API-key style authentication.
+    """
+
     async def _auth_callback(**_kwargs) -> dict[str, str]:  # noqa: ANN003
         return dict(default_headers)
 
@@ -456,6 +588,12 @@ def _build_openapi_auth_callback(default_headers: dict[str, str]):
 
 
 def _handle_mcp_command(command_text: str, mcp: OpenAPIMCPInterface | None) -> bool:
+    """Handle manual MCP slash commands.
+
+    Returns:
+        bool: True if command_text was an MCP command and was handled.
+    """
+
     if not command_text.startswith("/mcp"):
         return False
 
@@ -507,6 +645,15 @@ def _handle_mcp_command(command_text: str, mcp: OpenAPIMCPInterface | None) -> b
 
 
 def load_agent_prompt_config(file_path: str) -> AgentPromptConfig:
+    """Load and validate agent system prompt + few-shot examples from YAML.
+
+    Expected shape:
+        prompt: <string>
+        example:
+          - question: <string>
+            answer: <string>
+    """
+
     path = Path(file_path)
     if not path.exists():
         raise ValueError(f"Agent prompt config file not found: {file_path}")
@@ -543,6 +690,11 @@ def load_agent_prompt_config(file_path: str) -> AgentPromptConfig:
 
 
 def build_search_data_source(config: AppConfig) -> dict[str, object] | None:
+    """Build Azure AI Search data source payload for OYD chat requests.
+
+    Returns None if grounding is not configured.
+    """
+
     if not config.search_endpoint or not config.search_index_name:
         return None
 
@@ -567,6 +719,13 @@ def build_search_data_source(config: AppConfig) -> dict[str, object] | None:
 
 
 def create_chat_service(config: AppConfig) -> ChatCompletionClientBase:
+    """Create an AzureChatCompletion service for the selected provider mode.
+
+    Auth mode is chosen based on whether an API key is present:
+    - API key auth when key is provided.
+    - DefaultAzureCredential token provider when key is omitted.
+    """
+
     # Foundry values may be supplied as project endpoints. SK chat completion
     # expects the account endpoint shape.
     if config.provider == "foundry":
@@ -613,12 +772,20 @@ def create_chat_service(config: AppConfig) -> ChatCompletionClientBase:
 
 
 async def run_chat() -> None:
+    """Run the interactive chat REPL.
+
+    This function orchestrates initialization, optional plugin registration,
+    optional grounding, slash-command handling, and assistant responses.
+    """
+
     config = load_config()
     agent_prompt_config = load_agent_prompt_config(config.agent_prompt_file)
 
     kernel = Kernel()
     chat_service = create_chat_service(config)
     kernel.add_service(chat_service)
+    # Seed history with system prompt and optional few-shot examples to shape
+    # assistant behavior before user interaction starts.
     history = ChatHistory()
     history.add_system_message(agent_prompt_config.prompt)
     for example in agent_prompt_config.examples:
@@ -633,6 +800,8 @@ async def run_chat() -> None:
         settings.extra_body = {"data_sources": [search_data_source]}
         search_grounding_active = True
 
+    # mcp_interface powers manual slash commands; mcp_auto_plugin_enabled tracks
+    # whether SK automatic function-calling is active for normal chat turns.
     mcp_interface: OpenAPIMCPInterface | None = None
     mcp_auto_plugin_enabled = False
     if config.mcp_openapi_spec_url:
@@ -653,6 +822,8 @@ async def run_chat() -> None:
                 timeout=float(config.mcp_timeout_seconds),
                 auth_callback=_build_openapi_auth_callback(config.mcp_default_headers),
             )
+            # Register OpenAPI operations as kernel functions so the model can
+            # discover and call them automatically.
             kernel.add_plugin_from_openapi(
                 plugin_name="mcp",
                 openapi_parsed_spec=openapi_spec,
@@ -665,9 +836,9 @@ async def run_chat() -> None:
             )
             mcp_auto_plugin_enabled = True
 
-            # Current Foundry/Azure OpenAI chat endpoint behavior can reject the
-            # message sequence produced when both OYD grounding and auto tool
-            # invocation are enabled at the same time.
+            # Compatibility guard:
+            # Current endpoint behavior can reject request payloads when OYD
+            # grounding and automatic function-calling are both enabled.
             if search_grounding_active:
                 settings.extra_body = None
                 search_grounding_active = False
@@ -736,6 +907,7 @@ async def run_chat() -> None:
             if not user_text:
                 continue
 
+            # Slash commands are processed before normal model turns.
             try:
                 if _handle_mcp_command(user_text, mcp_interface):
                     print()
