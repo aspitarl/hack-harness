@@ -29,6 +29,7 @@ from urllib.request import Request, urlopen
 
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
+import httpx
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -589,27 +590,88 @@ def _format_mcp_help() -> str:
 def _extract_mcp_request_details(kwargs: dict[str, object]) -> tuple[str, str, str]:
     """Best-effort extraction of operation/method/url from OpenAPI callback kwargs."""
 
-    operation = str(
-        kwargs.get("operation_id")
-        or kwargs.get("operationId")
-        or kwargs.get("function_name")
-        or kwargs.get("functionName")
-        or "unknown_operation"
-    )
-    method = str(
-        kwargs.get("method")
-        or kwargs.get("http_method")
-        or kwargs.get("httpMethod")
-        or "UNKNOWN"
-    ).upper()
-    url = str(
-        kwargs.get("url")
-        or kwargs.get("request_url")
-        or kwargs.get("requestUrl")
-        or kwargs.get("uri")
-        or "unknown_url"
-    )
+    def _from_mapping_or_attr(obj: object, names: list[str]) -> object | None:
+        if obj is None:
+            return None
+        for name in names:
+            if isinstance(obj, dict) and name in obj:
+                value = obj[name]
+                if value is not None:
+                    return value
+            elif hasattr(obj, name):
+                value = getattr(obj, name)
+                if value is not None:
+                    return value
+        return None
+
+    operation_names = [
+        "operation_id",
+        "operationId",
+        "operation",
+        "function_name",
+        "functionName",
+        "name",
+    ]
+    method_names = ["method", "http_method", "httpMethod"]
+    url_names = ["url", "request_url", "requestUrl", "uri"]
+
+    operation_value = _from_mapping_or_attr(kwargs, operation_names)
+    method_value = _from_mapping_or_attr(kwargs, method_names)
+    url_value = _from_mapping_or_attr(kwargs, url_names)
+
+    # Semantic Kernel may pass request metadata nested under context/request objects.
+    nested_candidates: list[object] = [
+        kwargs.get("request") if isinstance(kwargs, dict) else None,
+        kwargs.get("http_request") if isinstance(kwargs, dict) else None,
+        kwargs.get("context") if isinstance(kwargs, dict) else None,
+    ]
+
+    if isinstance(kwargs, dict):
+        operation_value = operation_value or _from_mapping_or_attr(
+            kwargs.get("operation"), operation_names
+        )
+
+    for candidate in nested_candidates:
+        if operation_value is None:
+            operation_value = _from_mapping_or_attr(candidate, operation_names)
+        if method_value is None:
+            method_value = _from_mapping_or_attr(candidate, method_names)
+        if url_value is None:
+            url_value = _from_mapping_or_attr(candidate, url_names)
+
+        if isinstance(candidate, dict):
+            nested_request = candidate.get("request")
+            if method_value is None:
+                method_value = _from_mapping_or_attr(nested_request, method_names)
+            if url_value is None:
+                url_value = _from_mapping_or_attr(nested_request, url_names)
+
+    operation = str(operation_value or "unknown_operation")
+    method = str(method_value or "UNKNOWN").upper()
+    url = str(url_value or "unknown_url")
     return operation, method, url
+
+
+def _build_mcp_http_client(timeout_seconds: int) -> httpx.AsyncClient:
+    """Create an HTTP client that logs MCP auto-call request/response details."""
+
+    async def _log_request(request: httpx.Request) -> None:
+        print(
+            "debug> mcp auto-call request: "
+            f"method={request.method.upper()} url={request.url}"
+        )
+
+    async def _log_response(response: httpx.Response) -> None:
+        print(
+            "debug> mcp auto-call response: "
+            f"status={response.status_code} method={response.request.method.upper()} "
+            f"url={response.request.url}"
+        )
+
+    return httpx.AsyncClient(
+        timeout=float(timeout_seconds),
+        event_hooks={"request": [_log_request], "response": [_log_response]},
+    )
 
 
 def _build_openapi_auth_callback(default_headers: dict[str, str]):
@@ -620,10 +682,8 @@ def _build_openapi_auth_callback(default_headers: dict[str, str]):
     """
 
     async def _auth_callback(**_kwargs) -> dict[str, str]:  # noqa: ANN003
-        operation, method, url = _extract_mcp_request_details(_kwargs)
-        print(
-            f"debug> mcp auto-call: operation={operation} method={method} url={url}"
-        )
+        # OpenAPI runner passes request headers as kwargs here, not request
+        # metadata like method/url. Keep this callback auth-only.
         return dict(default_headers)
 
     return _auth_callback
@@ -845,6 +905,7 @@ async def run_chat() -> None:
     # mcp_interface powers manual slash commands; mcp_auto_plugin_enabled tracks
     # whether SK automatic function-calling is active for normal chat turns.
     mcp_interface: OpenAPIMCPInterface | None = None
+    mcp_http_client: httpx.AsyncClient | None = None
     mcp_auto_plugin_enabled = False
     if config.mcp_openapi_spec_url:
         try:
@@ -860,10 +921,12 @@ async def run_chat() -> None:
                 timeout_seconds=config.mcp_timeout_seconds,
             )
             openapi_execution_settings = OpenAPIFunctionExecutionParameters(
+                http_client=_build_mcp_http_client(config.mcp_timeout_seconds),
                 server_url_override=mcp_interface.base_url,
                 timeout=float(config.mcp_timeout_seconds),
                 auth_callback=_build_openapi_auth_callback(config.mcp_default_headers),
             )
+            mcp_http_client = openapi_execution_settings.http_client
             # Register OpenAPI operations as kernel functions so the model can
             # discover and call them automatically.
             kernel.add_plugin_from_openapi(
@@ -982,6 +1045,9 @@ async def run_chat() -> None:
             assistant_text = str(response)
             history.add_assistant_message(assistant_text)
             print(f"assistant> {assistant_text}\n")
+
+    if mcp_http_client is not None:
+        await mcp_http_client.aclose()
 
     print("Exiting chat.")
 
