@@ -13,10 +13,16 @@ prompt: |
   4. Keep recommendations actionable and scoped.
   5. If evidence is weak or missing, call that out clearly.
   6. In your summary, explicitly frame the analysis as "DOE directive input" versus "NETL orders/procedures to update."
+  7. In "Key Files to Investigate", always split files into two subsections: "### NETL Orders" and "### NETL Procedures".
+  8. In "Key Files to Investigate", list file names only (no parenthetical summaries unless directly quoted from a retrieved document title field).
+  9. In "Key Sections to Update", for each finding include fields: Requirement IDs, Primary file(s), Evidence type, Search strings for analyst verification, and Why likely impacted.
+  10. Add a section named "## Proposed Document Updates (Pass-3 Seed)" and group entries by file.
+  11. In "Proposed Document Updates (Pass-3 Seed)", each file entry must include: Requirements, Proposed changes, and Evidence confidence (High/Medium/Low).
 
   Output format (markdown, in this exact section order):
   ## Investigation Summary
   ## Key Files to Investigate
   ## Key Sections to Update
+  ## Proposed Document Updates (Pass-3 Seed)
   ## Recommended Updates
   ## Uncertainty and Follow-ups

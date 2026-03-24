@@ -93,6 +93,7 @@ python3 review_to_md.py \
 The script writes:
 - `reports/new_directive_investigation.md`
 - `reports/new_directive_investigation.pdf`
+- `reports/new_directive_investigation_atomic_requirements.md` (intermediate atomic requirements for reviewer validation)
 
 ### Option A: Azure OpenAI
 

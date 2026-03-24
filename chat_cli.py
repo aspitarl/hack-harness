@@ -897,13 +897,58 @@ def _build_investigate_user_message(directive_name: str, directive_text: str) ->
         [
             "Identify which existing NETL procedure and NETL order documents likely need updates based on this DOE directive.",
             "Return markdown in this section order:",
-            "## Investigation Summary\n## Key Files to Investigate\n## Key Sections to Update\n## Recommended Updates\n## Uncertainty and Follow-ups",
+            "## Investigation Summary\n## Key Files to Investigate\n## Key Sections to Update\n## Proposed Document Updates (Pass-3 Seed)\n## Recommended Updates\n## Uncertainty and Follow-ups",
+            "In 'Key Files to Investigate', use this exact structure: '### NETL Orders' then '### NETL Procedures'.",
+            "In 'Key Files to Investigate', list only file names exactly as retrieved; do not add parenthetical summaries or inferred document-purpose text.",
+            "In 'Key Sections to Update', structure each finding with: Requirement IDs, Primary file(s), Evidence type, Search strings for analyst verification, and Why likely impacted.",
+            "In 'Proposed Document Updates (Pass-3 Seed)', group entries by file and include fields: Requirements, Proposed changes, Evidence confidence (High/Medium/Low).",
             "In 'Key Sections to Update', include specific excerpted passages from NETL orders/procedures that indicate likely impact.",
             "In 'Investigation Summary', clearly state: DOE directive input analyzed against NETL orders/procedures.",
             f"### DOE DIRECTIVE INPUT: {directive_name}",
             directive_text,
         ]
     )
+
+
+def sanitize_investigation_markdown(report_markdown: str) -> str:
+    """Normalize investigation markdown to avoid inferred file-purpose summaries.
+
+    This sanitizer removes parenthetical descriptions from bullets inside
+    "## Key Files to Investigate" so file identifiers remain exact and
+    non-speculative.
+    """
+
+    lines = report_markdown.splitlines()
+    if not lines:
+        return report_markdown
+
+    in_key_files_section = False
+    file_bullet_pattern = re.compile(
+        r"^(\s*-\s+[A-Za-z0-9._\-/]+\.(?:pdf|txt|md))\s+\([^\n)]*\)\s*$",
+        re.IGNORECASE,
+    )
+
+    sanitized_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped == "## Key Files to Investigate":
+            in_key_files_section = True
+            sanitized_lines.append(line)
+            continue
+
+        if in_key_files_section and stripped.startswith("## "):
+            in_key_files_section = False
+
+        if in_key_files_section:
+            match = file_bullet_pattern.match(line)
+            if match:
+                sanitized_lines.append(match.group(1))
+                continue
+
+        sanitized_lines.append(line)
+
+    return "\n".join(sanitized_lines)
 
 
 def _query_preview(text: str, max_chars: int = 160) -> str:
@@ -1525,6 +1570,7 @@ async def run_chat() -> None:
                 continue
 
             assistant_text = str(response)
+            assistant_text = sanitize_investigation_markdown(assistant_text)
             history.add_assistant_message(assistant_text)
             print(f"assistant> {assistant_text}\n")
 
