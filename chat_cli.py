@@ -899,7 +899,9 @@ def _build_investigate_user_message(directive_name: str, directive_text: str) ->
             "Return markdown in this section order:",
             "## Investigation Summary\n## Key Files to Investigate\n## Key Sections to Update\n## Proposed Document Updates (Pass-3 Seed)\n## Recommended Updates\n## Uncertainty and Follow-ups",
             "In 'Key Files to Investigate', use this exact structure: '### NETL Orders' then '### NETL Procedures'.",
-            "In 'Key Files to Investigate', list only file names exactly as retrieved; do not add parenthetical summaries or inferred document-purpose text.",
+            "In 'Key Files to Investigate', list file names exactly as retrieved and append type label in parentheses: '(Order)' for NETL Orders and '(Procedure)' for NETL Procedures.",
+            "For every filename mention anywhere in the report (including 'Primary file(s)' and per-file update sections), append the same type label '(Order)' or '(Procedure)'.",
+            "Do not add any other parenthetical summary text besides the required type label.",
             "In 'Key Sections to Update', structure each finding with: Requirement IDs, Primary file(s), Evidence type, Search strings for analyst verification, and Why likely impacted.",
             "In 'Proposed Document Updates (Pass-3 Seed)', group entries by file and include fields: Requirements, Proposed changes, Evidence confidence (High/Medium/Low).",
             "In 'Key Sections to Update', include specific excerpted passages from NETL orders/procedures that indicate likely impact.",
@@ -911,11 +913,11 @@ def _build_investigate_user_message(directive_name: str, directive_text: str) ->
 
 
 def sanitize_investigation_markdown(report_markdown: str) -> str:
-    """Normalize investigation markdown to avoid inferred file-purpose summaries.
+    """Normalize investigation markdown while preserving required file-type labels.
 
-    This sanitizer removes parenthetical descriptions from bullets inside
-    "## Key Files to Investigate" so file identifiers remain exact and
-    non-speculative.
+    This sanitizer removes unsupported parenthetical descriptions from bullets
+    inside "## Key Files to Investigate". The explicit type labels
+    "(Order)" and "(Procedure)" are preserved.
     """
 
     lines = report_markdown.splitlines()
@@ -924,7 +926,7 @@ def sanitize_investigation_markdown(report_markdown: str) -> str:
 
     in_key_files_section = False
     file_bullet_pattern = re.compile(
-        r"^(\s*-\s+[A-Za-z0-9._\-/]+\.(?:pdf|txt|md))\s+\([^\n)]*\)\s*$",
+        r"^(\s*-\s+[A-Za-z0-9._\-/]+\.(?:pdf|txt|md))(?:\s+\(([^\n)]*)\))?\s*$",
         re.IGNORECASE,
     )
 
@@ -943,7 +945,11 @@ def sanitize_investigation_markdown(report_markdown: str) -> str:
         if in_key_files_section:
             match = file_bullet_pattern.match(line)
             if match:
-                sanitized_lines.append(match.group(1))
+                label = (match.group(2) or "").strip().lower()
+                if label in {"order", "procedure"}:
+                    sanitized_lines.append(f"{match.group(1)} ({match.group(2).strip()})")
+                else:
+                    sanitized_lines.append(match.group(1))
                 continue
 
         sanitized_lines.append(line)
