@@ -1,0 +1,19 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run Standard Pipeline",
+      "type": "shell",
+      "command": "python3",
+      "args": [
+        "review_to_md.py",
+        "--directive",
+        "pdfs/new_directive.pdf",
+        "--out",
+        "reports/new_directive_investigation.md"
+      ],
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}
