@@ -39,6 +39,7 @@ from chat_cli import (
     create_chat_service,
     load_agent_prompt_config,
     load_config,
+    sanitize_investigation_markdown,
 )
 
 
@@ -1000,7 +1001,8 @@ async def _generate_report(
             history.add_user_message(
                 f"{requirements_message}\n\n"
                 "When no explicit section number is present in retrieved evidence, provide an exact search string the reviewer can use in the NETL file.\n"
-                "In the final report, include one subsection per NETL file under Proposed Document Updates (Stage 3 Seed), each containing a 'What needs to be updated' bullet list."
+                "Keep the final report concise and triage-focused for Stage 3.\n"
+                "Under Proposed Document Updates (Stage 3 Seed), include one subsection per NETL file with short 'Proposed changes' bullets only."
             )
         else:
             history.add_user_message(user_message)
@@ -1015,7 +1017,7 @@ async def _generate_report(
         settings=settings,
         kernel=kernel,
     )
-    report_text = str(response)
+    report_text = sanitize_investigation_markdown(str(response))
 
     stage3_history = ChatHistory()
     stage3_history.add_system_message(agent_prompt_config.prompt)

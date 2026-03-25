@@ -896,15 +896,20 @@ def _build_investigate_user_message(directive_name: str, directive_text: str) ->
     return "\n\n".join(
         [
             "Identify which existing NETL procedure and NETL order documents likely need updates based on this DOE directive.",
+            "Keep output concise and triage-focused for Stage 3 (identify what to review first and why).",
             "Return markdown in this section order:",
             "## Investigation Summary\n## Key Files to Investigate\n## Key Sections to Update\n## Proposed Document Updates (Stage 3 Seed)\n## Recommended Updates\n## Uncertainty and Follow-ups",
             "In 'Key Files to Investigate', use this exact structure: '### NETL Orders' then '### NETL Procedures'.",
             "In 'Key Files to Investigate', list file names exactly as retrieved and append type label in parentheses: '(Order)' for NETL Orders and '(Procedure)' for NETL Procedures.",
             "For every filename mention anywhere in the report (including 'Primary file(s)' and per-file update sections), append the same type label '(Order)' or '(Procedure)'.",
             "Do not add any other parenthetical summary text besides the required type label.",
-            "In 'Key Sections to Update', structure each finding with: Requirement IDs, Primary file(s), Evidence type, Search strings for analyst verification, and Why likely impacted.",
-            "In 'Proposed Document Updates (Stage 3 Seed)', group entries by file and include fields: Requirements, Proposed changes, Evidence confidence (High/Medium/Low).",
-            "In 'Key Sections to Update', include specific excerpted passages from NETL orders/procedures that indicate likely impact.",
+            "In 'Key Sections to Update', include at most 5 findings.",
+            "For each finding include only: Requirement IDs, Primary file(s), Evidence type, Evidence excerpt, and Why likely impacted.",
+            "Do not include search-string lists.",
+            "In 'Proposed Document Updates (Stage 3 Seed)', group entries by file and include only: Requirements, Proposed changes, Evidence confidence (High/Medium/Low).",
+            "For each file, keep Proposed changes to 2-3 concise bullets.",
+            "In 'Recommended Updates', provide no more than 4 bullets ordered by Stage 3 priority.",
+            "In 'Uncertainty and Follow-ups', provide no more than 3 bullets.",
             "In 'Investigation Summary', clearly state: DOE directive input analyzed against NETL orders/procedures.",
             f"### DOE DIRECTIVE INPUT: {directive_name}",
             directive_text,
@@ -925,6 +930,7 @@ def sanitize_investigation_markdown(report_markdown: str) -> str:
         return report_markdown
 
     in_key_files_section = False
+    skipping_search_strings_block = False
     file_bullet_pattern = re.compile(
         r"^(\s*-\s+[A-Za-z0-9._\-/]+\.(?:pdf|txt|md))(?:\s+\(([^\n)]*)\))?\s*$",
         re.IGNORECASE,
@@ -933,6 +939,28 @@ def sanitize_investigation_markdown(report_markdown: str) -> str:
     sanitized_lines: list[str] = []
     for line in lines:
         stripped = line.strip()
+
+        if skipping_search_strings_block:
+            if not stripped:
+                continue
+            lowered = stripped.lower()
+            if lowered.startswith("why likely impacted"):
+                skipping_search_strings_block = False
+            elif stripped.startswith("### ") or stripped.startswith("## "):
+                skipping_search_strings_block = False
+            elif stripped.startswith("---"):
+                skipping_search_strings_block = False
+            elif stripped.startswith("-") or stripped.startswith("*"):
+                continue
+            else:
+                continue
+
+        lowered = stripped.lower()
+        if lowered.startswith("search strings for analyst verification") or lowered.startswith(
+            "search strings"
+        ):
+            skipping_search_strings_block = True
+            continue
 
         if stripped == "## Key Files to Investigate":
             in_key_files_section = True
