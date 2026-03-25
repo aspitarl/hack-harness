@@ -48,6 +48,19 @@ class ReviewToMdContractTests(unittest.TestCase):
         self.assertTrue(yes_index < unclear_index < no_index)
         self.assertIn("Update needed: Yes", sorted_markdown)
 
+    def test_stage3_header_uses_markdown_formatted_update_value(self) -> None:
+        markdown = "\n".join(
+            [
+                "### file-a.md — Update needed: Unclear",
+                "#### Update evaluation",
+                "- Update needed: **Yes**",
+            ]
+        )
+
+        sorted_markdown = _apply_update_needed_headers_and_sort(markdown)
+
+        self.assertIn("### file-a.md — Update needed: Yes", sorted_markdown)
+
     def test_atomic_requirements_markdown_has_expected_sections(self) -> None:
         output = _format_atomic_requirements_markdown(
             directive_name="directive.pdf",

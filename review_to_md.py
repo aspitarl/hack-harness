@@ -522,12 +522,18 @@ def _build_stage3_snippet_evidence_summary(
 
 def _extract_update_needed_from_section(section_text: str) -> str:
     match = re.search(
-        r"(?im)^\s*-\s*Update\s+needed:\s*(Yes|No|Unclear)\b",
+        r"(?im)^\s*-\s*Update\s+needed:\s*(.+?)\s*$",
         section_text,
     )
     if not match:
         return "Unclear"
-    return match.group(1).title()
+
+    normalized_value = re.sub(r"[*_`]+", "", match.group(1)).strip()
+    value_match = re.match(r"^(Yes|No|Unclear)\b", normalized_value, flags=re.IGNORECASE)
+    if not value_match:
+        return "Unclear"
+
+    return value_match.group(1).title()
 
 
 def _sort_rank_for_update_needed(value: str) -> int:
