@@ -153,9 +153,12 @@ if artifacts is not None:
     st.subheader("Investigation Output")
     st.caption("Report is generated and available for download.")
 
-    markdown_bytes = artifacts.report_markdown.encode("utf-8")
-    download_name = f"{Path(st.session_state.uploaded_name or 'investigation').stem}_investigation.md"
-    pdf_source_markdown = artifacts.stage3_report_markdown or artifacts.report_markdown
+    stage3_markdown = artifacts.stage3_report_markdown or artifacts.report_markdown
+    markdown_bytes = stage3_markdown.encode("utf-8")
+    download_name = (
+        f"{Path(st.session_state.uploaded_name or 'investigation').stem}_stage3_updates.md"
+    )
+    pdf_source_markdown = stage3_markdown
     pdf_bytes = b""
     pdf_error: str | None = None
     try:
@@ -187,8 +190,10 @@ if artifacts is not None:
         if st.button("Save to Blob"):
             try:
                 blob_url = _save_markdown_to_blob(
-                    artifacts.report_markdown,
-                    file_name=st.session_state.uploaded_name or "directive.md",
+                    stage3_markdown,
+                    file_name=(
+                        f"{Path(st.session_state.uploaded_name or 'investigation').stem}_stage3_updates.md"
+                    ),
                     blob_prefix=blob_prefix,
                 )
                 st.success(f"Saved: {blob_url}")
