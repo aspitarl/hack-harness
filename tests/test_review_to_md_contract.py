@@ -2,8 +2,10 @@ import unittest
 
 from review_to_md import (
     _apply_update_needed_headers_and_sort,
+    _build_stage3_snippet_evidence_summary,
     _extract_atomic_requirements,
     _format_atomic_requirements_markdown,
+    render_markdown_pdf_bytes,
 )
 
 
@@ -55,6 +57,43 @@ class ReviewToMdContractTests(unittest.TestCase):
         self.assertIn("## Atomic Requirements Review", output)
         self.assertIn("## Extracted Requirements", output)
         self.assertIn("## Review Guidance", output)
+
+    def test_stage3_snippet_summary_keeps_files_with_missing_snippets(self) -> None:
+        summary = _build_stage3_snippet_evidence_summary(
+            [
+                {
+                    "file_name": "file-a.md",
+                    "documents": [{}],
+                }
+            ]
+        )
+
+        self.assertIn("## Stage 3 snippet evidence by file", summary)
+        self.assertIn("- file-a.md", summary)
+        self.assertIn("No snippet text extracted", summary)
+
+    def test_stage3_snippet_summary_empty_input_message(self) -> None:
+        summary = _build_stage3_snippet_evidence_summary([])
+        self.assertEqual(summary, "No Stage 3 snippet evidence available.")
+
+    def test_render_markdown_pdf_bytes_non_empty_for_markdown(self) -> None:
+        markdown = "\n".join(
+            [
+                "# Stage 3 Compliance Updates",
+                "",
+                "- Update needed: Yes",
+                "1. First numbered point",
+                "",
+                "```",
+                "sample_code = True",
+                "```",
+            ]
+        )
+
+        pdf_bytes = render_markdown_pdf_bytes(markdown)
+
+        self.assertIsInstance(pdf_bytes, bytes)
+        self.assertGreater(len(pdf_bytes), 0)
 
 
 if __name__ == "__main__":

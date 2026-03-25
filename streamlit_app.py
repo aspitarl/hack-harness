@@ -1,25 +1,19 @@
 import hashlib
 import os
 import contextlib
-from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import time
-import re
-from xml.sax.saxutils import escape
 
 import streamlit as st
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.platypus import ListFlowable, ListItem, Paragraph, Preformatted, SimpleDocTemplate, Spacer
 
 from review_to_md import (
     InvestigationArtifacts,
     generate_investigation_artifacts_sync,
+    render_markdown_pdf_bytes,
 )
 
 
@@ -114,161 +108,7 @@ def _save_markdown_to_blob(markdown: str, file_name: str, blob_prefix: str = "re
 
 
 def _render_markdown_pdf_bytes(markdown: str) -> bytes:
-    def _inline_markdown_to_paragraph_html(text: str) -> str:
-        html = escape(text)
-        html = re.sub(r"`([^`]+)`", r"<font name='Courier'>\1</font>", html)
-        html = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", html)
-        html = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", html)
-        return html
-
-    def _flush_paragraph(story: list, paragraph_lines: list[str], body_style: ParagraphStyle) -> None:
-        if not paragraph_lines:
-            return
-        merged = " ".join(part.strip() for part in paragraph_lines if part.strip())
-        if merged:
-            story.append(Paragraph(_inline_markdown_to_paragraph_html(merged), body_style))
-        paragraph_lines.clear()
-
-    def _flush_bullets(story: list, bullet_items: list[str], body_style: ParagraphStyle) -> None:
-        if not bullet_items:
-            return
-        list_items = [
-            ListItem(Paragraph(_inline_markdown_to_paragraph_html(item), body_style))
-            for item in bullet_items
-        ]
-        story.append(ListFlowable(list_items, bulletType="bullet", leftIndent=18))
-        bullet_items.clear()
-
-    def _flush_numbered(story: list, numbered_items: list[str], body_style: ParagraphStyle) -> None:
-        if not numbered_items:
-            return
-        list_items = [
-            ListItem(Paragraph(_inline_markdown_to_paragraph_html(item), body_style))
-            for item in numbered_items
-        ]
-        story.append(ListFlowable(list_items, bulletType="1", leftIndent=18))
-        numbered_items.clear()
-
-    def _flush_code_block(story: list, code_lines: list[str], code_style: ParagraphStyle) -> None:
-        if not code_lines:
-            return
-        code_text = "\n".join(code_lines)
-        story.append(Preformatted(code_text, code_style))
-        code_lines.clear()
-
-    pdf_buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        pdf_buffer,
-        pagesize=letter,
-        leftMargin=0.75 * inch,
-        rightMargin=0.75 * inch,
-        topMargin=0.75 * inch,
-        bottomMargin=0.75 * inch,
-    )
-
-    styles = getSampleStyleSheet()
-    body_style = ParagraphStyle(
-        "Body",
-        parent=styles["BodyText"],
-        fontSize=10,
-        leading=14,
-        spaceAfter=6,
-    )
-    heading_styles = {
-        1: ParagraphStyle("H1", parent=styles["Heading1"], spaceBefore=8, spaceAfter=8),
-        2: ParagraphStyle("H2", parent=styles["Heading2"], spaceBefore=6, spaceAfter=6),
-        3: ParagraphStyle("H3", parent=styles["Heading3"], spaceBefore=4, spaceAfter=4),
-        4: ParagraphStyle("H4", parent=styles["Heading4"], spaceBefore=4, spaceAfter=4),
-        5: ParagraphStyle("H5", parent=styles["Heading5"], spaceBefore=3, spaceAfter=3),
-        6: ParagraphStyle("H6", parent=styles["Heading6"], spaceBefore=3, spaceAfter=3),
-    }
-    code_style = ParagraphStyle(
-        "Code",
-        parent=body_style,
-        fontName="Courier",
-        fontSize=8.5,
-        leading=10,
-        leftIndent=8,
-    )
-
-    story: list = []
-    paragraph_lines: list[str] = []
-    bullet_items: list[str] = []
-    numbered_items: list[str] = []
-    code_lines: list[str] = []
-    in_code_block = False
-
-    for raw_line in markdown.splitlines():
-        line = raw_line.rstrip()
-        stripped = line.strip()
-
-        if stripped.startswith("```"):
-            _flush_paragraph(story, paragraph_lines, body_style)
-            _flush_bullets(story, bullet_items, body_style)
-            _flush_numbered(story, numbered_items, body_style)
-            if in_code_block:
-                _flush_code_block(story, code_lines, code_style)
-                story.append(Spacer(1, 6))
-                in_code_block = False
-            else:
-                in_code_block = True
-            continue
-
-        if in_code_block:
-            code_lines.append(line)
-            continue
-
-        if not stripped:
-            _flush_paragraph(story, paragraph_lines, body_style)
-            _flush_bullets(story, bullet_items, body_style)
-            _flush_numbered(story, numbered_items, body_style)
-            story.append(Spacer(1, 6))
-            continue
-
-        heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
-        if heading_match:
-            _flush_paragraph(story, paragraph_lines, body_style)
-            _flush_bullets(story, bullet_items, body_style)
-            _flush_numbered(story, numbered_items, body_style)
-            level = len(heading_match.group(1))
-            heading_text = heading_match.group(2)
-            story.append(
-                Paragraph(
-                    _inline_markdown_to_paragraph_html(heading_text),
-                    heading_styles.get(level, heading_styles[6]),
-                )
-            )
-            continue
-
-        bullet_match = re.match(r"^[-*]\s+(.*)$", stripped)
-        if bullet_match:
-            _flush_paragraph(story, paragraph_lines, body_style)
-            _flush_numbered(story, numbered_items, body_style)
-            bullet_items.append(bullet_match.group(1))
-            continue
-
-        numbered_match = re.match(r"^\d+\.\s+(.*)$", stripped)
-        if numbered_match:
-            _flush_paragraph(story, paragraph_lines, body_style)
-            _flush_bullets(story, bullet_items, body_style)
-            numbered_items.append(numbered_match.group(1))
-            continue
-
-        _flush_bullets(story, bullet_items, body_style)
-        _flush_numbered(story, numbered_items, body_style)
-        paragraph_lines.append(stripped)
-
-    _flush_paragraph(story, paragraph_lines, body_style)
-    _flush_bullets(story, bullet_items, body_style)
-    _flush_numbered(story, numbered_items, body_style)
-    if in_code_block:
-        _flush_code_block(story, code_lines, code_style)
-
-    if not story:
-        story = [Paragraph("(Empty markdown report)", body_style)]
-
-    doc.build(story)
-    return pdf_buffer.getvalue()
+    return render_markdown_pdf_bytes(markdown)
 
 
 if "artifacts" not in st.session_state:
@@ -315,7 +155,13 @@ if artifacts is not None:
 
     markdown_bytes = artifacts.report_markdown.encode("utf-8")
     download_name = f"{Path(st.session_state.uploaded_name or 'investigation').stem}_investigation.md"
-    pdf_bytes = _render_markdown_pdf_bytes(artifacts.stage3_report_markdown)
+    pdf_source_markdown = artifacts.stage3_report_markdown or artifacts.report_markdown
+    pdf_bytes = b""
+    pdf_error: str | None = None
+    try:
+        pdf_bytes = _render_markdown_pdf_bytes(pdf_source_markdown)
+    except Exception as exc:  # noqa: BLE001
+        pdf_error = str(exc)
     pdf_download_name = (
         f"{Path(st.session_state.uploaded_name or 'investigation').stem}_stage3_updates.pdf"
     )
@@ -325,12 +171,15 @@ if artifacts is not None:
         file_name=download_name,
         mime="text/markdown",
     )
-    st.download_button(
-        "Download PDF",
-        data=pdf_bytes,
-        file_name=pdf_download_name,
-        mime="application/pdf",
-    )
+    if pdf_error:
+        st.warning(f"PDF generation failed, markdown is still available: {pdf_error}")
+    else:
+        st.download_button(
+            "Download PDF",
+            data=pdf_bytes,
+            file_name=pdf_download_name,
+            mime="application/pdf",
+        )
 
     save_to_blob = st.checkbox("Also save markdown to Azure Blob Storage")
     if save_to_blob:

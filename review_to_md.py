@@ -13,8 +13,9 @@ from xml.sax.saxutils import escape
 import httpx
 from azure.identity import DefaultAzureCredential
 from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.pdfgen import canvas
+from reportlab.platypus import ListFlowable, ListItem, Paragraph, Preformatted, SimpleDocTemplate, Spacer
 from pypdf import PdfReader
 from tqdm import tqdm
 
@@ -503,16 +504,18 @@ def _build_stage3_snippet_evidence_summary(
             if not text:
                 continue
             normalized = re.sub(r"\s+", " ", text)
+            if normalized in {"{}", "[]", "null"}:
+                continue
             snippets.append(normalized[:280])
             if len(snippets) >= 3:
                 break
 
-        if not snippets:
-            continue
-
         lines.append(f"- {file_name}")
-        for snippet in snippets:
-            lines.append(f"  - \"{snippet}\"")
+        if snippets:
+            for snippet in snippets:
+                lines.append(f"  - \"{snippet}\"")
+        else:
+            lines.append("  - \"No snippet text extracted from retrieved evidence; rely on full_document_text when available.\"")
 
     return "\n".join(lines)
 
@@ -878,7 +881,14 @@ def _build_stage3_delta_user_message(
     requirements_message: str,
     context_payload: str,
     snippet_evidence_summary: str,
+    has_stage3_files: bool,
 ) -> str:
+    no_files_instruction = (
+        "If no files are available in stage3_file_compliance, output exactly: 'No Stage 3 files identified.'"
+        if has_stage3_files
+        else "No files are available in stage3_file_compliance. Output exactly: 'No Stage 3 files identified.'"
+    )
+
     return "\n\n".join(
         [
             f"### DOE DIRECTIVE INPUT: {directive_name}",
@@ -901,7 +911,7 @@ def _build_stage3_delta_user_message(
             "Only add rows for snippets that actually exist in retrieved evidence; if none exist, omit section 4 for that file.",
             "Do not use placeholder text such as 'Search:' in table cells.",
             "Also include an Evidence confidence line (High/Medium/Low) per file.",
-            "If no files are available in Stage 3 evidence, output exactly: 'No Stage 3 files identified.'",
+            no_files_instruction,
             "## Baseline report from Stage 1/2",
             baseline_report,
             requirements_message,
@@ -909,6 +919,164 @@ def _build_stage3_delta_user_message(
             snippet_evidence_summary,
         ]
     )
+
+
+def render_markdown_pdf_bytes(markdown: str) -> bytes:
+    def _inline_markdown_to_paragraph_html(text: str) -> str:
+        html = escape(text)
+        html = re.sub(r"`([^`]+)`", r"<font name='Courier'>\1</font>", html)
+        html = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", html)
+        html = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", html)
+        return html
+
+    def _flush_paragraph(story: list, paragraph_lines: list[str], body_style: ParagraphStyle) -> None:
+        if not paragraph_lines:
+            return
+        merged = " ".join(part.strip() for part in paragraph_lines if part.strip())
+        if merged:
+            story.append(Paragraph(_inline_markdown_to_paragraph_html(merged), body_style))
+        paragraph_lines.clear()
+
+    def _flush_bullets(story: list, bullet_items: list[str], body_style: ParagraphStyle) -> None:
+        if not bullet_items:
+            return
+        list_items = [
+            ListItem(Paragraph(_inline_markdown_to_paragraph_html(item), body_style))
+            for item in bullet_items
+        ]
+        story.append(ListFlowable(list_items, bulletType="bullet", leftIndent=18))
+        bullet_items.clear()
+
+    def _flush_numbered(story: list, numbered_items: list[str], body_style: ParagraphStyle) -> None:
+        if not numbered_items:
+            return
+        list_items = [
+            ListItem(Paragraph(_inline_markdown_to_paragraph_html(item), body_style))
+            for item in numbered_items
+        ]
+        story.append(ListFlowable(list_items, bulletType="1", leftIndent=18))
+        numbered_items.clear()
+
+    def _flush_code_block(story: list, code_lines: list[str], code_style: ParagraphStyle) -> None:
+        if not code_lines:
+            return
+        code_text = "\n".join(code_lines)
+        story.append(Preformatted(code_text, code_style))
+        code_lines.clear()
+
+    pdf_buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        pdf_buffer,
+        pagesize=letter,
+        leftMargin=0.75 * inch,
+        rightMargin=0.75 * inch,
+        topMargin=0.75 * inch,
+        bottomMargin=0.75 * inch,
+    )
+
+    styles = getSampleStyleSheet()
+    body_style = ParagraphStyle(
+        "Body",
+        parent=styles["BodyText"],
+        fontSize=10,
+        leading=14,
+        spaceAfter=6,
+    )
+    heading_styles = {
+        1: ParagraphStyle("H1", parent=styles["Heading1"], spaceBefore=8, spaceAfter=8),
+        2: ParagraphStyle("H2", parent=styles["Heading2"], spaceBefore=6, spaceAfter=6),
+        3: ParagraphStyle("H3", parent=styles["Heading3"], spaceBefore=4, spaceAfter=4),
+        4: ParagraphStyle("H4", parent=styles["Heading4"], spaceBefore=4, spaceAfter=4),
+        5: ParagraphStyle("H5", parent=styles["Heading5"], spaceBefore=3, spaceAfter=3),
+        6: ParagraphStyle("H6", parent=styles["Heading6"], spaceBefore=3, spaceAfter=3),
+    }
+    code_style = ParagraphStyle(
+        "Code",
+        parent=body_style,
+        fontName="Courier",
+        fontSize=8.5,
+        leading=10,
+        leftIndent=8,
+    )
+
+    story: list = []
+    paragraph_lines: list[str] = []
+    bullet_items: list[str] = []
+    numbered_items: list[str] = []
+    code_lines: list[str] = []
+    in_code_block = False
+
+    for raw_line in markdown.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            _flush_paragraph(story, paragraph_lines, body_style)
+            _flush_bullets(story, bullet_items, body_style)
+            _flush_numbered(story, numbered_items, body_style)
+            if in_code_block:
+                _flush_code_block(story, code_lines, code_style)
+                story.append(Spacer(1, 6))
+                in_code_block = False
+            else:
+                in_code_block = True
+            continue
+
+        if in_code_block:
+            code_lines.append(line)
+            continue
+
+        if not stripped:
+            _flush_paragraph(story, paragraph_lines, body_style)
+            _flush_bullets(story, bullet_items, body_style)
+            _flush_numbered(story, numbered_items, body_style)
+            story.append(Spacer(1, 6))
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading_match:
+            _flush_paragraph(story, paragraph_lines, body_style)
+            _flush_bullets(story, bullet_items, body_style)
+            _flush_numbered(story, numbered_items, body_style)
+            level = len(heading_match.group(1))
+            heading_text = heading_match.group(2)
+            story.append(
+                Paragraph(
+                    _inline_markdown_to_paragraph_html(heading_text),
+                    heading_styles.get(level, heading_styles[6]),
+                )
+            )
+            continue
+
+        bullet_match = re.match(r"^[-*]\s+(.*)$", stripped)
+        if bullet_match:
+            _flush_paragraph(story, paragraph_lines, body_style)
+            _flush_numbered(story, numbered_items, body_style)
+            bullet_items.append(bullet_match.group(1))
+            continue
+
+        numbered_match = re.match(r"^\d+\.\s+(.*)$", stripped)
+        if numbered_match:
+            _flush_paragraph(story, paragraph_lines, body_style)
+            _flush_bullets(story, bullet_items, body_style)
+            numbered_items.append(numbered_match.group(1))
+            continue
+
+        _flush_bullets(story, bullet_items, body_style)
+        _flush_numbered(story, numbered_items, body_style)
+        paragraph_lines.append(stripped)
+
+    _flush_paragraph(story, paragraph_lines, body_style)
+    _flush_bullets(story, bullet_items, body_style)
+    _flush_numbered(story, numbered_items, body_style)
+    if in_code_block:
+        _flush_code_block(story, code_lines, code_style)
+
+    if not story:
+        story = [Paragraph("(Empty markdown report)", body_style)]
+
+    doc.build(story)
+    return pdf_buffer.getvalue()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1129,6 +1297,7 @@ async def generate_investigation_artifacts(
             requirements_message=requirements_message,
             context_payload=context_payload,
             snippet_evidence_summary=snippet_evidence_summary,
+            has_stage3_files=bool(stage3_file_compliance),
         )
     )
     _log_stage(5, f"LLM Stage 3 refinement running (deployment/model: {model_label})")
@@ -1169,43 +1338,10 @@ def _write_output(output_path: Path, content: str) -> None:
 
 
 def _write_pdf_output(output_path: Path, content: str) -> None:
-    """Write a simple text-rendered PDF from markdown content."""
+    """Write a PDF from markdown content using shared markdown rendering."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    pdf = canvas.Canvas(str(output_path), pagesize=letter)
-    page_width, page_height = letter
-    left_margin = 0.75 * inch
-    top_margin = 0.75 * inch
-    bottom_margin = 0.75 * inch
-    line_height = 14
-    max_chars_per_line = 100
-
-    y = page_height - top_margin
-    lines = content.splitlines() or [""]
-
-    for raw_line in lines:
-        line = escape(raw_line)
-        if not line:
-            y -= line_height
-            if y <= bottom_margin:
-                pdf.showPage()
-                y = page_height - top_margin
-            continue
-
-        wrapped_chunks = [
-            line[index : index + max_chars_per_line]
-            for index in range(0, len(line), max_chars_per_line)
-        ]
-
-        for chunk in wrapped_chunks:
-            pdf.drawString(left_margin, y, chunk)
-            y -= line_height
-            if y <= bottom_margin:
-                pdf.showPage()
-                y = page_height - top_margin
-
-    pdf.save()
+    output_path.write_bytes(render_markdown_pdf_bytes(content))
 
 
 def main() -> None:
