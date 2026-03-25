@@ -318,112 +318,114 @@ if artifacts is not None:
     st.subheader("Investigation Output")
     st.caption("Report is generated and available for download.")
 
+    output_tab, visuals_tab = st.tabs(["Report Output", "Visual Summary"])
+
     stage3_markdown = artifacts.stage3_report_markdown or artifacts.report_markdown
-    markdown_bytes = stage3_markdown.encode("utf-8")
-    download_name = (
-        f"{Path(st.session_state.uploaded_name or 'investigation').stem}_stage3_updates.md"
-    )
-    pdf_source_markdown = stage3_markdown
-    pdf_bytes = b""
-    pdf_error: str | None = None
-    try:
-        pdf_bytes = _render_markdown_pdf_bytes(pdf_source_markdown)
-    except Exception as exc:  # noqa: BLE001
-        pdf_error = str(exc)
-    pdf_download_name = (
-        f"{Path(st.session_state.uploaded_name or 'investigation').stem}_stage3_updates.pdf"
-    )
-    st.download_button(
-        "Download Markdown",
-        data=markdown_bytes,
-        file_name=download_name,
-        mime="text/markdown",
-    )
-    if pdf_error:
-        st.warning(f"PDF generation failed, markdown is still available: {pdf_error}")
-    else:
+
+    with output_tab:
+        markdown_bytes = stage3_markdown.encode("utf-8")
+        download_name = (
+            f"{Path(st.session_state.uploaded_name or 'investigation').stem}_stage3_updates.md"
+        )
+        pdf_source_markdown = stage3_markdown
+        pdf_bytes = b""
+        pdf_error: str | None = None
+        try:
+            pdf_bytes = _render_markdown_pdf_bytes(pdf_source_markdown)
+        except Exception as exc:  # noqa: BLE001
+            pdf_error = str(exc)
+        pdf_download_name = (
+            f"{Path(st.session_state.uploaded_name or 'investigation').stem}_stage3_updates.pdf"
+        )
         st.download_button(
-            "Download PDF",
-            data=pdf_bytes,
-            file_name=pdf_download_name,
-            mime="application/pdf",
+            "Download Markdown",
+            data=markdown_bytes,
+            file_name=download_name,
+            mime="text/markdown",
         )
-
-    save_to_blob = st.checkbox("Also save markdown to Azure Blob Storage")
-    if save_to_blob:
-        blob_prefix = st.text_input("Blob folder", value="reports")
-        if st.button("Save to Blob"):
-            try:
-                blob_url = _save_markdown_to_blob(
-                    stage3_markdown,
-                    file_name=(
-                        f"{Path(st.session_state.uploaded_name or 'investigation').stem}_stage3_updates.md"
-                    ),
-                    blob_prefix=blob_prefix,
-                )
-                st.success(f"Saved: {blob_url}")
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Blob save failed: {exc}")
-
-    st.divider()
-    st.subheader("Visual Summary")
-
-    summary = _compute_visual_summary_data(
-        stage3_markdown=stage3_markdown,
-        atomic_requirements=artifacts.atomic_requirements,
-    )
-    sections = summary["sections"]
-
-    if not sections:
-        st.info("No Stage 3 file-level sections were found to visualize.")
-    else:
-        files_df = summary["files_df"]
-        status_counts = summary["status_counts"]
-        confidence_counts = summary["confidence_counts"]
-        coverage_df = summary["coverage_df"]
-        overall_confidence_pct = summary["overall_confidence_pct"]
-
-        files_requiring_updates = int((files_df["Update Needed"] == "Yes").sum())
-        metric_col1, metric_col2, metric_col3 = st.columns(3)
-        metric_col1.metric("Files analyzed", len(sections))
-        metric_col2.metric("Updates needed", files_requiring_updates)
-        metric_col3.metric(
-            "Overall confidence",
-            f"{overall_confidence_pct}%" if overall_confidence_pct is not None else "N/A",
-        )
-
-        chart_col1, chart_col2 = st.columns(2)
-        with chart_col1:
-            st.caption("Update needed distribution")
-            if status_counts:
-                status_df = pd.DataFrame(
-                    {
-                        "Status": list(status_counts.keys()),
-                        "Count": list(status_counts.values()),
-                    }
-                ).set_index("Status")
-                st.bar_chart(status_df)
-            else:
-                st.info("No update-needed values found.")
-
-        with chart_col2:
-            st.caption("Evidence confidence distribution")
-            if confidence_counts:
-                confidence_df = pd.DataFrame(
-                    {
-                        "Confidence": list(confidence_counts.keys()),
-                        "Count": list(confidence_counts.values()),
-                    }
-                ).set_index("Confidence")
-                st.bar_chart(confidence_df)
-            else:
-                st.info("No confidence values found.")
-
-        st.caption("Requirement-to-file coverage matrix (1 = matched, 0 = no match)")
-        if not coverage_df.empty:
-            st.dataframe(coverage_df, use_container_width=True, hide_index=True)
+        if pdf_error:
+            st.warning(f"PDF generation failed, markdown is still available: {pdf_error}")
         else:
-            st.info("No requirement coverage data available.")
+            st.download_button(
+                "Download PDF",
+                data=pdf_bytes,
+                file_name=pdf_download_name,
+                mime="application/pdf",
+            )
 
-        st.caption("Per-file triage table")
-        st.dataframe(files_df, use_container_width=True, hide_index=True)
+        save_to_blob = st.checkbox("Also save markdown to Azure Blob Storage")
+        if save_to_blob:
+            blob_prefix = st.text_input("Blob folder", value="reports")
+            if st.button("Save to Blob"):
+                try:
+                    blob_url = _save_markdown_to_blob(
+                        stage3_markdown,
+                        file_name=(
+                            f"{Path(st.session_state.uploaded_name or 'investigation').stem}_stage3_updates.md"
+                        ),
+                        blob_prefix=blob_prefix,
+                    )
+                    st.success(f"Saved: {blob_url}")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Blob save failed: {exc}")
+
+    with visuals_tab:
+        summary = _compute_visual_summary_data(
+            stage3_markdown=stage3_markdown,
+            atomic_requirements=artifacts.atomic_requirements,
+        )
+        sections = summary["sections"]
+
+        if not sections:
+            st.info("No Stage 3 file-level sections were found to visualize.")
+        else:
+            files_df = summary["files_df"]
+            status_counts = summary["status_counts"]
+            confidence_counts = summary["confidence_counts"]
+            coverage_df = summary["coverage_df"]
+            overall_confidence_pct = summary["overall_confidence_pct"]
+
+            files_requiring_updates = int((files_df["Update Needed"] == "Yes").sum())
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            metric_col1.metric("Files analyzed", len(sections))
+            metric_col2.metric("Updates needed", files_requiring_updates)
+            metric_col3.metric(
+                "Overall confidence",
+                f"{overall_confidence_pct}%" if overall_confidence_pct is not None else "N/A",
+            )
+
+            chart_col1, chart_col2 = st.columns(2)
+            with chart_col1:
+                st.caption("Update needed distribution")
+                if status_counts:
+                    status_df = pd.DataFrame(
+                        {
+                            "Status": list(status_counts.keys()),
+                            "Count": list(status_counts.values()),
+                        }
+                    ).set_index("Status")
+                    st.bar_chart(status_df)
+                else:
+                    st.info("No update-needed values found.")
+
+            with chart_col2:
+                st.caption("Evidence confidence distribution")
+                if confidence_counts:
+                    confidence_df = pd.DataFrame(
+                        {
+                            "Confidence": list(confidence_counts.keys()),
+                            "Count": list(confidence_counts.values()),
+                        }
+                    ).set_index("Confidence")
+                    st.bar_chart(confidence_df)
+                else:
+                    st.info("No confidence values found.")
+
+            st.caption("Requirement-to-file coverage matrix (1 = matched, 0 = no match)")
+            if not coverage_df.empty:
+                st.dataframe(coverage_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No requirement coverage data available.")
+
+            st.caption("Per-file triage table")
+            st.dataframe(files_df, use_container_width=True, hide_index=True)
