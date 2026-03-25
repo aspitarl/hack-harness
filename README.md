@@ -1,122 +1,79 @@
-# hack-harness
+# DOE Directive Impact Analysis Pipeline
 
-A Python command-line chat harness built with Semantic Kernel.
+This repository analyzes a new DOE directive and identifies NETL orders/procedures that likely require updates.
 
-## What this does
+The pipeline performs staged retrieval plus model synthesis and produces report artifacts reviewers can use for triage.
 
-- Uses Semantic Kernel chat completion only (no Azure AI Agent Framework).
-- Supports two endpoint modes from `.env`:
-	- Azure OpenAI endpoint
-	- Foundry project endpoint with chat deployment
-- Optional MCP-like tool interface backed by a published OpenAPI 3.x spec.
-- Includes a DOE new-directive investigation command for identifying orders/procedures that likely need updates.
-- Exits on `Ctrl+C` or `Ctrl+X`.
+## What the pipeline does
 
-## Files
+- Extracts atomic requirements from the incoming directive.
+- Runs Stage 1/2 relevance flagging using requirement-based and directive-chunk search hits.
+- Runs Stage 3 file-level evidence assembly for flagged files (snippets + full PDF text when available).
+- Performs model synthesis to produce update recommendations and reviewer-ready artifacts.
 
-- `chat_cli.py` - interactive CLI chat app
-- `requirements.txt` - Python dependencies
-- `.env` - runtime configuration
+For the detailed flow diagram and stage notes, see `doc/pipeline_flow.md`.
 
-## Setup
+## Repository entry points
 
-1. Create and activate a virtual environment (optional but recommended).
+- `review_to_md.py` - non-interactive pipeline run that writes markdown/PDF artifacts.
+- `streamlit_app.py` - web UI for upload, run, visualization, and downloads.
+- `chat_cli.py` - interactive CLI with `/investigate` command and optional MCP tooling.
+- `tests/test_review_to_md_contract.py` - contract tests for requirement extraction and report formatting.
+
+## Quick start
+
+1. (Recommended) create and activate a virtual environment.
 2. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Edit `.env`.
+3. Configure environment variables in `.env` (see configuration section below).
 
-### Agent Prompt Configuration
+## Run the pipeline (recommended)
 
-This project loads a system prompt from an agent config file in `agents/`.
-
-```env
-AGENT_PROMPT_FILE=agents/default.yaml
-```
-
-Expected YAML shape:
-
-```yaml
-prompt: |
-	You are a helpful assistant...
-```
-
-The `prompt` is added as a system message at startup.
-
-### DOE New-Directive Investigation Command
-
-Inside the interactive prompt, run:
-
-```text
-/investigate --directive <new-directive-file>
-```
-
-Supported file types:
-
-- Directive: `.pdf`, `.txt`, `.md`
-
-For paths with spaces, wrap each path in quotes.
-
-Example with your current files:
-
-```text
-/investigate --directive "pdfs/new_directive.pdf"
-```
-
-The command loads directive text, searches procedures and orders from Azure AI Search, and returns a markdown investigation report.
-
-- Investigation summary
-- Key files to investigate
-- Key sections to update
-- Recommended updates
-- Uncertainty and follow-ups
-
-Notes:
-
-- Very large documents are truncated before prompt submission.
-- Scanned PDFs without embedded text require OCR before analysis.
-
-### One-shot Investigation to Markdown + PDF
-
-Use this non-interactive script to run one investigation and save markdown output.
-It also generates a PDF with the same base filename at the end.
+One-shot run with file outputs:
 
 ```bash
 python3 review_to_md.py \
-	--directive "pdfs/new_directive.pdf" \
-	--out "reports/new_directive_investigation.md"
+  --directive "pdfs/new_directive.pdf" \
+  --out "reports/new_directive_investigation.md"
 ```
 
-The script writes:
-- `reports/new_directive_investigation.md`
-- `reports/new_directive_investigation.pdf`
-- `reports/new_directive_investigation_stage1_atomic_requirements.md` (stage 1 intermediate atomic requirements for reviewer validation)
-- `reports/new_directive_investigation_stage3_updates.md` (stage 3 file-level compliance updates)
-- `reports/new_directive_investigation_stage3_updates.pdf` (stage 3 file-level compliance updates as PDF)
+Outputs written per run:
 
-### Streamlit UI (upload directive, generate markdown)
+- `<out>.md` - consolidated investigation markdown.
+- `<out>.pdf` - PDF rendering of the consolidated investigation.
+- `<out>_stage1_atomic_requirements.md` - extracted requirements for reviewer validation.
+- `<out>_stage3_updates.md` - Stage 3 file-level update assessments.
+- `<out>_stage3_updates.pdf` - PDF rendering of Stage 3 updates.
 
-The CLI remains fully supported. You can also run a web UI that reuses the same investigation pipeline.
+Example output files already in this repo are under `reports/`.
+
+## Run with Streamlit UI
 
 ```bash
 streamlit run streamlit_app.py
 ```
 
 In the app:
-- Drag/drop a directive file (`.pdf`, `.txt`, `.md`)
-- Click **Run Investigation**
-- Preview markdown and download report
-- Optional: save report markdown to Azure Blob Storage
 
-Optional Blob save environment variables:
+- Upload directive file (`.pdf`, `.txt`, `.md`).
+- Run the DOE directive impact analysis pipeline.
+- Download Stage 3 markdown/PDF outputs.
+- View Stage 3 visual summary (status, confidence, requirement-to-file coverage).
+
+Optional Stage 3 markdown save to Blob Storage:
 
 ```env
 AZURE_STORAGE_ACCOUNT_URL=https://<storage-account>.blob.core.windows.net
 AZURE_STORAGE_CONTAINER=<container-name>
 ```
+
+## Configuration
+
+The pipeline supports two chat backends.
 
 ### Option A: Azure OpenAI
 
@@ -140,18 +97,16 @@ FOUNDRY_CHAT_DEPLOYMENT=<your-chat-deployment-name>
 FOUNDRY_API_VERSION=2024-10-21
 ```
 
-### Optional: Azure AI Search grounding
+### Azure AI Search retrieval configuration
 
-You can ground responses with an Azure AI Search index in either provider mode.
-
-Set both of these values to enable grounding:
+Single index mode:
 
 ```env
 AZURE_AI_SEARCH_ENDPOINT=https://<your-search-service>.search.windows.net
 AZURE_AI_SEARCH_INDEX_NAME=<your-index-name>
 ```
 
-Dual-index mode (orders + procedures):
+Dual index mode (orders + procedures):
 
 ```env
 AZURE_AI_SEARCH_ENDPOINT=https://<your-search-service>.search.windows.net
@@ -159,15 +114,12 @@ AZURE_AI_SEARCH_ORDERS_INDEX_NAME=<orders-index-name>
 AZURE_AI_SEARCH_PROCEDURES_INDEX_NAME=<procedures-index-name>
 ```
 
-In dual-index mode, the CLI runs one search per index, merges results, and sends a
-"Documents to investigate" candidate list to the model.
+Authentication:
 
-Authentication for Search:
+- Set `AZURE_AI_SEARCH_API_KEY` for API-key auth, or
+- leave it blank to use managed identity / default credential.
 
-- API key mode: set `AZURE_AI_SEARCH_API_KEY`.
-- Keyless mode: leave `AZURE_AI_SEARCH_API_KEY` blank and use managed identity.
-
-Optional tuning:
+Optional retrieval tuning:
 
 ```env
 AZURE_AI_SEARCH_SEMANTIC_CONFIGURATION=<semantic-config-name>
@@ -177,60 +129,37 @@ AZURE_AI_SEARCH_STRICTNESS=3
 AZURE_AI_SEARCH_TOP_N_DOCUMENTS=5
 ```
 
-When enabled, the CLI prints that grounding is active and shows the selected index name at startup.
-
-### Optional: MCP-like OpenAPI tools
-
-You can enable an MCP-style tool surface where each OpenAPI operation is exposed as a callable tool in the CLI.
-When configured, Semantic Kernel also loads the OpenAPI operations as a plugin and can automatically invoke tools during normal chat turns.
+### Agent prompt configuration
 
 ```env
-MCP_OPENAPI_SPEC_URL=https://func-amdojxfludppe.azurewebsites.net/api/spec/openapi?code=<your-code>
-MCP_BASE_URL=
-MCP_TIMEOUT_SECONDS=30
-MCP_DEFAULT_HEADERS={}
+AGENT_PROMPT_FILE=agents/default.yaml
 ```
 
-Notes:
+Expected shape:
 
-- `MCP_OPENAPI_SPEC_URL` is required to enable MCP commands.
-- `MCP_BASE_URL` is optional; if empty, the app resolves a base URL from the spec. If the spec server points to localhost, it falls back to the spec URL host.
-- `MCP_DEFAULT_HEADERS` must be a JSON object string (for example `{"x-api-key":"..."}`).
-
-Interactive commands:
-
-```text
-/mcp tools
-/mcp tools/list
-/mcp call <tool_name> <json-args>
-/mcp tools/call <tool_name> <json-args>
-/mcp reload
+```yaml
+prompt: |
+  You are a helpful assistant...
 ```
 
-Automatic mode:
+## Optional interactive CLI mode
 
-- Ask naturally in chat (for example, "What's the weather in Seattle?") and the model can automatically select and call MCP/OpenAPI tools.
-- Slash commands remain available for manual inspection and testing.
-
-Example:
-
-```text
-/mcp call getWeatherForecast {"latitude":47.6,"longitude":-122.3}
-```
-
-## Run
+Run:
 
 ```bash
 python chat_cli.py
 ```
 
-Type your message at `you>`. The app exits immediately on `Ctrl+C` or `Ctrl+X`.
+Inside the REPL, run investigation command:
 
-## Notes
+```text
+/investigate --directive "pdfs/new_directive.pdf"
+```
 
-- The script is structured so you can later add grounding with Azure AI Search and tools backed by your Function App MCP server.
-- If your deployment requires a different API version, update the matching `*_API_VERSION` value in `.env`.
-- If the API key value is blank, the app automatically falls back to Azure Default Credential.
-- In `foundry` mode, keyless auth requests tokens for `https://ai.azure.com/.default`.
-- In `azure_openai` mode, keyless auth requests tokens for `https://cognitiveservices.azure.com/.default`.
-- In `foundry` mode, if you provide a project endpoint URL, the app automatically uses the account endpoint host for chat completion calls.
+This path is useful for interactive exploration, but `review_to_md.py` is the primary reproducible pipeline entry point.
+
+## Notes and constraints
+
+- Scanned PDFs without embedded text require OCR before analysis.
+- Very large directive text may be truncated before prompt submission.
+- Stage 3 performs retrieval/evidence preparation; model reasoning is in downstream synthesis.
