@@ -96,6 +96,27 @@ The script writes:
 - `reports/new_directive_investigation_stage1_atomic_requirements.md` (stage 1 intermediate atomic requirements for reviewer validation)
 - `reports/new_directive_investigation_stage3_updates.md` (stage 3 file-level compliance updates)
 
+### Streamlit UI (upload directive, generate markdown)
+
+The CLI remains fully supported. You can also run a web UI that reuses the same investigation pipeline.
+
+```bash
+streamlit run streamlit_app.py
+```
+
+In the app:
+- Drag/drop a directive file (`.pdf`, `.txt`, `.md`)
+- Click **Run Investigation**
+- Preview markdown and download report
+- Optional: save report markdown to Azure Blob Storage
+
+Optional Blob save environment variables:
+
+```env
+AZURE_STORAGE_ACCOUNT_URL=https://<storage-account>.blob.core.windows.net
+AZURE_STORAGE_CONTAINER=<container-name>
+```
+
 ### Option A: Azure OpenAI
 
 ```env

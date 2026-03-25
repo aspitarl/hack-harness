@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 from io import BytesIO
 import json
 from pathlib import Path
@@ -50,6 +51,14 @@ STAGE2_FULL_DIRECTIVE_CHUNK_OVERLAP = 300
 STAGE3_MAX_FILES = 20
 STAGE3_FULL_TEXT_MAX_CHARS = 16000
 STAGE3_FULL_TEXT_MIN_CHARS = 500
+
+
+@dataclass
+class InvestigationArtifacts:
+    report_markdown: str
+    atomic_requirements: list[str]
+    requirements_review_markdown: str
+    stage3_report_markdown: str
 
 
 def _log_stage(stage_number: int, message: str) -> None:
@@ -320,14 +329,18 @@ async def _run_file_compliance_stage3(
     requirements_for_retrieval: list[str],
     affected_files: list[str],
     dual_index_enabled: bool,
+    max_files: int = STAGE3_MAX_FILES,
 ) -> list[dict[str, object]]:
     if not affected_files:
+        return []
+
+    if max_files <= 0:
         return []
 
     requirement_seed = " ".join(requirements_for_retrieval[:3])
     directive_seed = _truncate_for_prompt(directive_text, max_chars=600)
     results: list[dict[str, object]] = []
-    files_to_check = affected_files[:STAGE3_MAX_FILES]
+    files_to_check = affected_files[:max_files]
     _log_stage(3, "Per-file compliance scan")
 
     for file_name in tqdm(
@@ -502,6 +515,85 @@ def _build_stage3_snippet_evidence_summary(
             lines.append(f"  - \"{snippet}\"")
 
     return "\n".join(lines)
+
+
+def _extract_update_needed_from_section(section_text: str) -> str:
+    match = re.search(
+        r"(?im)^\s*-\s*Update\s+needed:\s*(Yes|No|Unclear)\b",
+        section_text,
+    )
+    if not match:
+        return "Unclear"
+    return match.group(1).title()
+
+
+def _sort_rank_for_update_needed(value: str) -> int:
+    normalized = value.strip().lower()
+    if normalized == "yes":
+        return 0
+    if normalized == "unclear":
+        return 1
+    if normalized == "no":
+        return 2
+    return 3
+
+
+def _apply_update_needed_headers_and_sort(stage3_markdown: str) -> str:
+    lines = stage3_markdown.splitlines()
+    if not lines:
+        return stage3_markdown
+
+    top_lines: list[str] = []
+    sections: list[list[str]] = []
+    current_section: list[str] | None = None
+    seen_first_section = False
+
+    for line in lines:
+        if line.startswith("### ") and not line.startswith("#### "):
+            seen_first_section = True
+            if current_section is not None:
+                sections.append(current_section)
+            current_section = [line]
+            continue
+
+        if current_section is None:
+            if not seen_first_section:
+                top_lines.append(line)
+        else:
+            current_section.append(line)
+
+    if current_section is not None:
+        sections.append(current_section)
+
+    if not sections:
+        return stage3_markdown
+
+    decorated_sections: list[tuple[int, int, list[str]]] = []
+    for idx, section in enumerate(sections):
+        update_needed = _extract_update_needed_from_section("\n".join(section))
+        header = section[0]
+        header_without_flag = re.sub(
+            r"\s*[—-]\s*Update\s+needed\s*:\s*(Yes|No|Unclear)\s*$",
+            "",
+            header,
+            flags=re.IGNORECASE,
+        )
+        section[0] = f"{header_without_flag} — Update needed: {update_needed}"
+        decorated_sections.append((_sort_rank_for_update_needed(update_needed), idx, section))
+
+    decorated_sections.sort(key=lambda item: (item[0], item[1]))
+
+    rebuilt_lines: list[str] = []
+    if top_lines:
+        rebuilt_lines.extend(top_lines)
+        rebuilt_lines.append("")
+
+    for section_index, (_, _, section_lines) in enumerate(decorated_sections):
+        if section_index > 0:
+            rebuilt_lines.append("")
+        rebuilt_lines.extend(section_lines)
+
+    return "\n".join(rebuilt_lines)
 
 
 def _format_requirement_search_context_for_message(
@@ -839,9 +931,10 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def _generate_report(
+async def generate_investigation_artifacts(
     directive_path: str,
-) -> tuple[str, list[str], str, str]:
+    max_stage3_files: int = STAGE3_MAX_FILES,
+) -> InvestigationArtifacts:
     config = load_config()
     agent_prompt_config = load_agent_prompt_config(config.agent_prompt_file)
 
@@ -930,6 +1023,7 @@ async def _generate_report(
             requirements_for_retrieval=requirements_for_retrieval,
             affected_files=affected_files,
             dual_index_enabled=True,
+            max_files=max_stage3_files,
         )
 
         context_payload = _format_requirement_search_context_for_message(
@@ -984,6 +1078,7 @@ async def _generate_report(
             requirements_for_retrieval=requirements_for_retrieval,
             affected_files=affected_files,
             dual_index_enabled=False,
+            max_files=max_stage3_files,
         )
 
         context_payload = _format_requirement_search_context_for_message(
@@ -1012,6 +1107,9 @@ async def _generate_report(
         )
         history.add_user_message(f"{user_message}\n\n{requirements_message}")
 
+    model_label = config.deployment_name or "unknown"
+    _log_stage(4, f"LLM analysis running (deployment/model: {model_label})")
+
     response = await chat_service.get_chat_message_content(
         chat_history=history,
         settings=settings,
@@ -1033,17 +1131,36 @@ async def _generate_report(
             snippet_evidence_summary=snippet_evidence_summary,
         )
     )
+    _log_stage(5, f"LLM Stage 3 refinement running (deployment/model: {model_label})")
     stage3_response = await chat_service.get_chat_message_content(
         chat_history=stage3_history,
         settings=settings,
         kernel=kernel,
     )
+    stage3_report = _apply_update_needed_headers_and_sort(str(stage3_response))
 
     requirements_review_markdown = _format_atomic_requirements_markdown(
         directive_name=directive_file.name,
         requirements=atomic_requirements,
     )
-    return report_text, atomic_requirements, requirements_review_markdown, str(stage3_response)
+    return InvestigationArtifacts(
+        report_markdown=report_text,
+        atomic_requirements=atomic_requirements,
+        requirements_review_markdown=requirements_review_markdown,
+        stage3_report_markdown=stage3_report,
+    )
+
+
+def generate_investigation_artifacts_sync(
+    directive_path: str,
+    max_stage3_files: int = STAGE3_MAX_FILES,
+) -> InvestigationArtifacts:
+    return asyncio.run(
+        generate_investigation_artifacts(
+            directive_path=directive_path,
+            max_stage3_files=max_stage3_files,
+        )
+    )
 
 
 def _write_output(output_path: Path, content: str) -> None:
@@ -1094,8 +1211,9 @@ def _write_pdf_output(output_path: Path, content: str) -> None:
 def main() -> None:
     args = _parse_args()
 
-    report, _, requirements_review, stage3_report = asyncio.run(
-        _generate_report(directive_path=args.directive)
+    artifacts = generate_investigation_artifacts_sync(directive_path=args.directive)
+    stage3_report = _apply_update_needed_headers_and_sort(
+        artifacts.stage3_report_markdown
     )
 
     output_path = Path(args.out).expanduser()
@@ -1111,9 +1229,9 @@ def main() -> None:
         f"{markdown_output.stem}_stage3_updates.md"
     )
 
-    _write_output(markdown_output, report)
-    _write_pdf_output(pdf_output, report)
-    _write_output(requirements_output, requirements_review)
+    _write_output(markdown_output, artifacts.report_markdown)
+    _write_pdf_output(pdf_output, artifacts.report_markdown)
+    _write_output(requirements_output, artifacts.requirements_review_markdown)
     _write_output(stage3_output, stage3_report)
     print(f"Investigation markdown report written to: {markdown_output}")
     print(f"Investigation PDF report written to: {pdf_output}")
