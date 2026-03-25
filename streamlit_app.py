@@ -19,9 +19,19 @@ from review_to_md import (
 )
 
 
-st.set_page_config(page_title="Directive Investigation", layout="wide")
-st.title("Directive Investigation")
-st.caption("Upload a directive and generate investigation markdown.")
+st.set_page_config(page_title="DOE Directive Impact Analysis Pipeline", layout="wide")
+st.title("DOE Directive Impact Analysis Pipeline")
+st.caption(
+    "Evaluate a new DOE directive against NETL orders/procedures and generate Stage 3 update recommendations."
+)
+st.markdown(
+    """
+**Pipeline stages**
+- **Stage 1/2 relevance flagging:** requirement- and chunk-based search hits identify likely candidate files.
+- **Stage 3 file-level evidence assembly:** file-level snippets and full-PDF text are assembled for flagged files.
+- **Model synthesis & report artifacts:** combined evidence is synthesized into update recommendations and downloadable outputs.
+"""
+)
 
 
 class _LiveLogWriter:
@@ -283,9 +293,9 @@ if "uploaded_digest" not in st.session_state:
 if "uploaded_name" not in st.session_state:
     st.session_state.uploaded_name = None
 
-uploaded_file = st.file_uploader("Drop directive file", type=["pdf", "txt", "md"])
-debug_mode = st.checkbox("Debug mode (only first 3 files in Stage 3)")
-run_clicked = st.button("Run Investigation", type="primary", disabled=uploaded_file is None)
+uploaded_file = st.file_uploader("Upload new directive file", type=["pdf", "txt", "md"])
+debug_mode = st.checkbox("Debug mode (limit Stage 3 evidence assembly to first 3 files)")
+run_clicked = st.button("Run Pipeline", type="primary", disabled=uploaded_file is None)
 run_log_panel = st.empty()
 
 if run_clicked and uploaded_file is not None:
@@ -293,9 +303,9 @@ if run_clicked and uploaded_file is not None:
     digest = _file_digest(data)
     st.session_state.uploaded_name = uploaded_file.name
     log_writer = _LiveLogWriter(run_log_panel)
-    run_log_panel.text("Starting investigation...")
+    run_log_panel.text("Starting pipeline...")
 
-    with st.spinner("Running investigation pipeline..."):
+    with st.spinner("Running DOE directive impact analysis pipeline..."):
         try:
             stage3_file_limit = 3 if debug_mode else 20
             with contextlib.redirect_stdout(log_writer), contextlib.redirect_stderr(log_writer):
@@ -307,7 +317,7 @@ if run_clicked and uploaded_file is not None:
             st.session_state.artifacts = artifacts
             st.session_state.uploaded_digest = digest
             log_writer.flush()
-            st.success("Investigation completed.")
+            st.success("Pipeline completed.")
         except Exception as exc:  # noqa: BLE001
             log_writer.flush()
             st.error(f"Pipeline failed: {exc}")
@@ -315,10 +325,10 @@ if run_clicked and uploaded_file is not None:
 artifacts = st.session_state.artifacts
 
 if artifacts is not None:
-    st.subheader("Investigation Output")
-    st.caption("Report is generated and available for download.")
+    st.subheader("Pipeline Outputs")
+    st.caption("Stage 3 updates report is ready for review and download.")
 
-    output_tab, visuals_tab = st.tabs(["Report Output", "Visual Summary"])
+    output_tab, visuals_tab = st.tabs(["Stage 3 Updates Report", "Stage 3 Visual Summary"])
 
     stage3_markdown = artifacts.stage3_report_markdown or artifacts.report_markdown
 
@@ -353,7 +363,7 @@ if artifacts is not None:
                 mime="application/pdf",
             )
 
-        save_to_blob = st.checkbox("Also save markdown to Azure Blob Storage")
+        save_to_blob = st.checkbox("Also save Stage 3 markdown to Azure Blob Storage")
         if save_to_blob:
             blob_prefix = st.text_input("Blob folder", value="reports")
             if st.button("Save to Blob"):
@@ -377,7 +387,7 @@ if artifacts is not None:
         sections = summary["sections"]
 
         if not sections:
-            st.info("No Stage 3 file-level sections were found to visualize.")
+            st.info("No Stage 3 file-level evidence sections were found to visualize.")
         else:
             files_df = summary["files_df"]
             status_counts = summary["status_counts"]
@@ -387,16 +397,16 @@ if artifacts is not None:
 
             files_requiring_updates = int((files_df["Update Needed"] == "Yes").sum())
             metric_col1, metric_col2, metric_col3 = st.columns(3)
-            metric_col1.metric("Files analyzed", len(sections))
-            metric_col2.metric("Updates needed", files_requiring_updates)
+            metric_col1.metric("Files with Stage 3 evidence", len(sections))
+            metric_col2.metric("Files likely needing updates", files_requiring_updates)
             metric_col3.metric(
-                "Overall confidence",
+                "Evidence confidence score",
                 f"{overall_confidence_pct}%" if overall_confidence_pct is not None else "N/A",
             )
 
             chart_col1, chart_col2 = st.columns(2)
             with chart_col1:
-                st.caption("Update needed distribution")
+                st.caption("Update-needed distribution")
                 if status_counts:
                     status_df = pd.DataFrame(
                         {
@@ -427,5 +437,5 @@ if artifacts is not None:
             else:
                 st.info("No requirement coverage data available.")
 
-            st.caption("Per-file triage table")
+            st.caption("Per-file Stage 3 triage table")
             st.dataframe(files_df, use_container_width=True, hide_index=True)
