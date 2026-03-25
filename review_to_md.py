@@ -13,9 +13,10 @@ from xml.sax.saxutils import escape
 import httpx
 from azure.identity import DefaultAzureCredential
 from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.platypus import ListFlowable, ListItem, Paragraph, Preformatted, SimpleDocTemplate, Spacer
+from reportlab.platypus import ListFlowable, ListItem, Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
 from pypdf import PdfReader
 from tqdm import tqdm
 
@@ -282,12 +283,28 @@ def _filter_docs_for_file_name(
     documents: list[dict[str, object]],
     file_name: str,
 ) -> list[dict[str, object]]:
+    def _normalize_name_key(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", value.lower())
+
     normalized_target = Path(file_name).name.lower()
+    normalized_target_key = _normalize_name_key(normalized_target)
+    normalized_target_stem_key = _normalize_name_key(Path(file_name).stem)
     filtered: list[dict[str, object]] = []
 
     for rank, document in enumerate(documents, start=1):
         candidate = Path(_extract_search_doc_name(document, rank)).name.lower()
+        candidate_key = _normalize_name_key(candidate)
+        candidate_stem_key = _normalize_name_key(Path(candidate).stem)
+
         if candidate == normalized_target:
+            filtered.append(document)
+            continue
+
+        if candidate_key and candidate_key == normalized_target_key:
+            filtered.append(document)
+            continue
+
+        if candidate_stem_key and candidate_stem_key == normalized_target_stem_key:
             filtered.append(document)
 
     return filtered
@@ -342,6 +359,17 @@ async def _run_file_compliance_stage3(
     directive_seed = _truncate_for_prompt(directive_text, max_chars=600)
     results: list[dict[str, object]] = []
     files_to_check = affected_files[:max_files]
+    stage3_stats = {
+        "files_checked": 0,
+        "no_direct_match": 0,
+        "source_ref_present": 0,
+        "source_ref_missing": 0,
+        "full_document_loaded": 0,
+        "full_document_unavailable": 0,
+        "matched_orders_total": 0,
+        "matched_procedures_total": 0,
+        "matched_documents_total": 0,
+    }
     _log_stage(3, "Per-file compliance scan")
 
     for file_name in tqdm(
@@ -349,6 +377,7 @@ async def _run_file_compliance_stage3(
         desc="Stage 3: checking files",
         unit="file",
     ):
+        stage3_stats["files_checked"] += 1
         query_text = _truncate_for_prompt(
             (
                 f"{file_name} compliance update check against DOE O 458.1. "
@@ -394,16 +423,11 @@ async def _run_file_compliance_stage3(
                 filtered_procedures = _filter_docs_for_file_name(retry_procedures, file_name)
 
             if not filtered_orders and not filtered_procedures:
-                continue
+                stage3_stats["no_direct_match"] += 1
 
             docs_for_file = filtered_orders + filtered_procedures
-            _log_stage(
-                3,
-                (
-                    f"{file_name}: matched orders={len(filtered_orders)} "
-                    f"procedures={len(filtered_procedures)}"
-                ),
-            )
+            stage3_stats["matched_orders_total"] += len(filtered_orders)
+            stage3_stats["matched_procedures_total"] += len(filtered_procedures)
             source_ref = next(
                 (
                     _extract_search_doc_source_ref(doc)
@@ -412,17 +436,17 @@ async def _run_file_compliance_stage3(
                 ),
                 None,
             )
-            _log_stage(3, f"{file_name}: source_ref={'present' if source_ref else 'missing'}")
+            if source_ref:
+                stage3_stats["source_ref_present"] += 1
+            else:
+                stage3_stats["source_ref_missing"] += 1
             full_document_text, full_document_error = await _load_full_document_text_for_stage3(
                 source_ref
             )
             if full_document_text:
-                _log_stage(
-                    3,
-                    f"{file_name}: full document loaded ({len(full_document_text)} chars)",
-                )
+                stage3_stats["full_document_loaded"] += 1
             else:
-                _log_stage(3, f"{file_name}: full document unavailable ({full_document_error})")
+                stage3_stats["full_document_unavailable"] += 1
 
             results.append(
                 {
@@ -444,9 +468,9 @@ async def _run_file_compliance_stage3(
                 filtered_documents = _filter_docs_for_file_name(retry_documents, file_name)
 
             if not filtered_documents:
-                continue
+                stage3_stats["no_direct_match"] += 1
 
-            _log_stage(3, f"{file_name}: matched documents={len(filtered_documents)}")
+            stage3_stats["matched_documents_total"] += len(filtered_documents)
             source_ref = next(
                 (
                     _extract_search_doc_source_ref(doc)
@@ -455,17 +479,17 @@ async def _run_file_compliance_stage3(
                 ),
                 None,
             )
-            _log_stage(3, f"{file_name}: source_ref={'present' if source_ref else 'missing'}")
+            if source_ref:
+                stage3_stats["source_ref_present"] += 1
+            else:
+                stage3_stats["source_ref_missing"] += 1
             full_document_text, full_document_error = await _load_full_document_text_for_stage3(
                 source_ref
             )
             if full_document_text:
-                _log_stage(
-                    3,
-                    f"{file_name}: full document loaded ({len(full_document_text)} chars)",
-                )
+                stage3_stats["full_document_loaded"] += 1
             else:
-                _log_stage(3, f"{file_name}: full document unavailable ({full_document_error})")
+                stage3_stats["full_document_unavailable"] += 1
 
             results.append(
                 {
@@ -477,6 +501,22 @@ async def _run_file_compliance_stage3(
                     "full_document_error": full_document_error,
                 }
             )
+
+    _log_stage(
+        3,
+        (
+            "Stage 3 stats: "
+            f"files={stage3_stats['files_checked']}, "
+            f"no_direct_match={stage3_stats['no_direct_match']}, "
+            f"source_ref_present={stage3_stats['source_ref_present']}, "
+            f"source_ref_missing={stage3_stats['source_ref_missing']}, "
+            f"full_document_loaded={stage3_stats['full_document_loaded']}, "
+            f"full_document_unavailable={stage3_stats['full_document_unavailable']}, "
+            f"matched_orders_total={stage3_stats['matched_orders_total']}, "
+            f"matched_procedures_total={stage3_stats['matched_procedures_total']}, "
+            f"matched_documents_total={stage3_stats['matched_documents_total']}"
+        ),
+    )
 
     return results
 
@@ -536,6 +576,22 @@ def _extract_update_needed_from_section(section_text: str) -> str:
     return value_match.group(1).title()
 
 
+def _extract_evidence_confidence_from_section(section_text: str) -> str:
+    match = re.search(
+        r"(?im)^\s*(?:-\s*)?Evidence\s+confidence:\s*(.+?)\s*$",
+        section_text,
+    )
+    if not match:
+        return "Unknown"
+
+    normalized_value = re.sub(r"[*_`]+", "", match.group(1)).strip()
+    value_match = re.match(r"^(High|Medium|Low)\b", normalized_value, flags=re.IGNORECASE)
+    if not value_match:
+        return "Unknown"
+
+    return value_match.group(1).title()
+
+
 def _sort_rank_for_update_needed(value: str) -> int:
     normalized = value.strip().lower()
     if normalized == "yes":
@@ -579,15 +635,20 @@ def _apply_update_needed_headers_and_sort(stage3_markdown: str) -> str:
 
     decorated_sections: list[tuple[int, int, list[str]]] = []
     for idx, section in enumerate(sections):
-        update_needed = _extract_update_needed_from_section("\n".join(section))
+        section_text = "\n".join(section)
+        update_needed = _extract_update_needed_from_section(section_text)
+        evidence_confidence = _extract_evidence_confidence_from_section(section_text)
         header = section[0]
         header_without_flag = re.sub(
-            r"\s*[—-]\s*Update\s+needed\s*:\s*(Yes|No|Unclear)\s*$",
+            r"\s*[—-]\s*Update\s+needed\s*:\s*(Yes|No|Unclear)\s*(?:[—-]\s*(?:Evidence\s+)?Confidence\s*:\s*(High|Medium|Low|Unknown))?\s*$",
             "",
             header,
             flags=re.IGNORECASE,
         )
-        section[0] = f"{header_without_flag} — Update needed: {update_needed}"
+        section[0] = (
+            f"{header_without_flag} — Update needed: {update_needed}"
+            f" — Evidence confidence: {evidence_confidence}"
+        )
         decorated_sections.append((_sort_rank_for_update_needed(update_needed), idx, section))
 
     decorated_sections.sort(key=lambda item: (item[0], item[1]))
@@ -970,6 +1031,51 @@ def render_markdown_pdf_bytes(markdown: str) -> bytes:
         story.append(Preformatted(code_text, code_style))
         code_lines.clear()
 
+    def _parse_table_cells(line: str) -> list[str]:
+        trimmed = line.strip()
+        if trimmed.startswith("|"):
+            trimmed = trimmed[1:]
+        if trimmed.endswith("|"):
+            trimmed = trimmed[:-1]
+        return [cell.strip() for cell in trimmed.split("|")]
+
+    def _is_table_separator_row(cells: list[str]) -> bool:
+        if not cells:
+            return False
+        for cell in cells:
+            if not re.fullmatch(r":?-{3,}:?", cell.strip()):
+                return False
+        return True
+
+    def _flush_table(story: list, table_rows: list[list[str]], body_style: ParagraphStyle) -> None:
+        if not table_rows:
+            return
+
+        max_cols = max(len(row) for row in table_rows)
+        normalized_rows = [row + [""] * (max_cols - len(row)) for row in table_rows]
+        table_data = [
+            [Paragraph(_inline_markdown_to_paragraph_html(cell), body_style) for cell in row]
+            for row in normalized_rows
+        ]
+        repeat_rows = 1 if len(table_data) > 1 else 0
+        table = Table(table_data, repeatRows=repeat_rows)
+        table.setStyle(
+            TableStyle(
+                [
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ]
+            )
+        )
+        story.append(table)
+        story.append(Spacer(1, 6))
+        table_rows.clear()
+
     pdf_buffer = BytesIO()
     doc = SimpleDocTemplate(
         pdf_buffer,
@@ -1009,6 +1115,7 @@ def render_markdown_pdf_bytes(markdown: str) -> bytes:
     paragraph_lines: list[str] = []
     bullet_items: list[str] = []
     numbered_items: list[str] = []
+    table_rows: list[list[str]] = []
     code_lines: list[str] = []
     in_code_block = False
 
@@ -1020,6 +1127,7 @@ def render_markdown_pdf_bytes(markdown: str) -> bytes:
             _flush_paragraph(story, paragraph_lines, body_style)
             _flush_bullets(story, bullet_items, body_style)
             _flush_numbered(story, numbered_items, body_style)
+            _flush_table(story, table_rows, body_style)
             if in_code_block:
                 _flush_code_block(story, code_lines, code_style)
                 story.append(Spacer(1, 6))
@@ -1036,6 +1144,7 @@ def render_markdown_pdf_bytes(markdown: str) -> bytes:
             _flush_paragraph(story, paragraph_lines, body_style)
             _flush_bullets(story, bullet_items, body_style)
             _flush_numbered(story, numbered_items, body_style)
+            _flush_table(story, table_rows, body_style)
             story.append(Spacer(1, 6))
             continue
 
@@ -1044,6 +1153,7 @@ def render_markdown_pdf_bytes(markdown: str) -> bytes:
             _flush_paragraph(story, paragraph_lines, body_style)
             _flush_bullets(story, bullet_items, body_style)
             _flush_numbered(story, numbered_items, body_style)
+            _flush_table(story, table_rows, body_style)
             level = len(heading_match.group(1))
             heading_text = heading_match.group(2)
             story.append(
@@ -1058,6 +1168,7 @@ def render_markdown_pdf_bytes(markdown: str) -> bytes:
         if bullet_match:
             _flush_paragraph(story, paragraph_lines, body_style)
             _flush_numbered(story, numbered_items, body_style)
+            _flush_table(story, table_rows, body_style)
             bullet_items.append(bullet_match.group(1))
             continue
 
@@ -1065,16 +1176,29 @@ def render_markdown_pdf_bytes(markdown: str) -> bytes:
         if numbered_match:
             _flush_paragraph(story, paragraph_lines, body_style)
             _flush_bullets(story, bullet_items, body_style)
+            _flush_table(story, table_rows, body_style)
             numbered_items.append(numbered_match.group(1))
+            continue
+
+        if stripped.startswith("|") and stripped.endswith("|"):
+            _flush_paragraph(story, paragraph_lines, body_style)
+            _flush_bullets(story, bullet_items, body_style)
+            _flush_numbered(story, numbered_items, body_style)
+            cells = _parse_table_cells(stripped)
+            if _is_table_separator_row(cells):
+                continue
+            table_rows.append(cells)
             continue
 
         _flush_bullets(story, bullet_items, body_style)
         _flush_numbered(story, numbered_items, body_style)
+        _flush_table(story, table_rows, body_style)
         paragraph_lines.append(stripped)
 
     _flush_paragraph(story, paragraph_lines, body_style)
     _flush_bullets(story, bullet_items, body_style)
     _flush_numbered(story, numbered_items, body_style)
+    _flush_table(story, table_rows, body_style)
     if in_code_block:
         _flush_code_block(story, code_lines, code_style)
 
@@ -1370,15 +1494,20 @@ def main() -> None:
     stage3_output = markdown_output.with_name(
         f"{markdown_output.stem}_stage3_updates.md"
     )
+    stage3_pdf_output = markdown_output.with_name(
+        f"{markdown_output.stem}_stage3_updates.pdf"
+    )
 
     _write_output(markdown_output, artifacts.report_markdown)
     _write_pdf_output(pdf_output, artifacts.report_markdown)
     _write_output(requirements_output, artifacts.requirements_review_markdown)
     _write_output(stage3_output, stage3_report)
+    _write_pdf_output(stage3_pdf_output, stage3_report)
     print(f"Investigation markdown report written to: {markdown_output}")
     print(f"Investigation PDF report written to: {pdf_output}")
     print(f"Atomic requirements review written to: {requirements_output}")
     print(f"Stage 3 compliance updates written to: {stage3_output}")
+    print(f"Stage 3 compliance PDF written to: {stage3_pdf_output}")
 
 
 if __name__ == "__main__":

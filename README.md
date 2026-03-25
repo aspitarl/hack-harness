@@ -95,6 +95,7 @@ The script writes:
 - `reports/new_directive_investigation.pdf`
 - `reports/new_directive_investigation_stage1_atomic_requirements.md` (stage 1 intermediate atomic requirements for reviewer validation)
 - `reports/new_directive_investigation_stage3_updates.md` (stage 3 file-level compliance updates)
+- `reports/new_directive_investigation_stage3_updates.pdf` (stage 3 file-level compliance updates as PDF)
 
 ### Streamlit UI (upload directive, generate markdown)
 

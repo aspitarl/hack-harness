@@ -4,6 +4,7 @@ from review_to_md import (
     _apply_update_needed_headers_and_sort,
     _build_stage3_snippet_evidence_summary,
     _extract_atomic_requirements,
+    _filter_docs_for_file_name,
     _format_atomic_requirements_markdown,
     render_markdown_pdf_bytes,
 )
@@ -54,12 +55,49 @@ class ReviewToMdContractTests(unittest.TestCase):
                 "### file-a.md — Update needed: Unclear",
                 "#### Update evaluation",
                 "- Update needed: **Yes**",
+                "- Evidence confidence: **High**",
             ]
         )
 
         sorted_markdown = _apply_update_needed_headers_and_sort(markdown)
 
-        self.assertIn("### file-a.md — Update needed: Yes", sorted_markdown)
+        self.assertIn(
+            "### file-a.md — Update needed: Yes — Evidence confidence: High",
+            sorted_markdown,
+        )
+
+    def test_stage3_header_uses_non_bulleted_evidence_confidence(self) -> None:
+        markdown = "\n".join(
+            [
+                "### file-a.md",
+                "#### Update evaluation",
+                "- Update needed: Yes",
+                "Evidence confidence: Medium",
+            ]
+        )
+
+        sorted_markdown = _apply_update_needed_headers_and_sort(markdown)
+
+        self.assertIn(
+            "### file-a.md — Update needed: Yes — Evidence confidence: Medium",
+            sorted_markdown,
+        )
+
+    def test_stage3_header_defaults_unknown_confidence(self) -> None:
+        markdown = "\n".join(
+            [
+                "### file-a.md",
+                "#### Update evaluation",
+                "- Update needed: No",
+            ]
+        )
+
+        sorted_markdown = _apply_update_needed_headers_and_sort(markdown)
+
+        self.assertIn(
+            "### file-a.md — Update needed: No — Evidence confidence: Unknown",
+            sorted_markdown,
+        )
 
     def test_atomic_requirements_markdown_has_expected_sections(self) -> None:
         output = _format_atomic_requirements_markdown(
@@ -89,6 +127,17 @@ class ReviewToMdContractTests(unittest.TestCase):
         summary = _build_stage3_snippet_evidence_summary([])
         self.assertEqual(summary, "No Stage 3 snippet evidence available.")
 
+    def test_filter_docs_for_file_name_matches_normalized_variants(self) -> None:
+        documents = [
+            {"metadata_storage_name": "411_2 original.pdf", "content": "alpha"},
+            {"metadata_storage_name": "other_file.pdf", "content": "beta"},
+        ]
+
+        filtered = _filter_docs_for_file_name(documents, "411_2original.pdf")
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["metadata_storage_name"], "411_2 original.pdf")
+
     def test_render_markdown_pdf_bytes_non_empty_for_markdown(self) -> None:
         markdown = "\n".join(
             [
@@ -100,6 +149,22 @@ class ReviewToMdContractTests(unittest.TestCase):
                 "```",
                 "sample_code = True",
                 "```",
+            ]
+        )
+
+        pdf_bytes = render_markdown_pdf_bytes(markdown)
+
+        self.assertIsInstance(pdf_bytes, bytes)
+        self.assertGreater(len(pdf_bytes), 0)
+
+    def test_render_markdown_pdf_bytes_non_empty_for_table_markdown(self) -> None:
+        markdown = "\n".join(
+            [
+                "## Existing text snippets vs suggested edits",
+                "",
+                "| Existing NETL text snippet | Suggested edit |",
+                "|---|---|",
+                "| Existing sentence | Updated sentence aligned to DOE O 458.1 |",
             ]
         )
 
