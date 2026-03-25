@@ -53,6 +53,7 @@ STAGE2_FULL_DIRECTIVE_CHUNK_OVERLAP = 300
 STAGE3_MAX_FILES = 20
 STAGE3_FULL_TEXT_MAX_CHARS = 16000
 STAGE3_FULL_TEXT_MIN_CHARS = 500
+STAGE3_FILENAME_RETRY_TOP_N = 40
 
 
 @dataclass
@@ -67,24 +68,63 @@ def _log_stage(stage_number: int, message: str) -> None:
     print(f"[Stage {stage_number}] {message}", flush=True)
 
 
-def _extract_search_doc_source_ref(document: dict[str, object]) -> str | None:
-    source_fields = [
-        "metadata_storage_url",
-        "blob_url",
-        "blobUrl",
-        "url",
-        "uri",
-        "metadata_storage_path",
-        "path",
-        "sourcefile",
-        "sourceFile",
-        "source_file",
-    ]
-    for field in source_fields:
+URL_SOURCE_FIELDS = [
+    "metadata_storage_url",
+    "blob_url",
+    "blobUrl",
+    "url",
+    "uri",
+]
+
+PATHLIKE_SOURCE_FIELDS = [
+    "metadata_storage_path",
+    "path",
+    "sourcefile",
+    "sourceFile",
+    "source_file",
+]
+
+
+def _is_http_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _collect_search_doc_source_refs(
+    document: dict[str, object],
+) -> list[tuple[str, str]]:
+    refs: list[tuple[str, str]] = []
+    for field in URL_SOURCE_FIELDS + PATHLIKE_SOURCE_FIELDS:
         value = document.get(field)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            refs.append((field, value.strip()))
+    return refs
+
+
+def _extract_search_doc_source_ref(document: dict[str, object]) -> str | None:
+    for _, value in _collect_search_doc_source_refs(document):
+        return value
     return None
+
+
+def _collect_source_ref_candidates(
+    documents: list[dict[str, object]],
+) -> list[tuple[str, str]]:
+    seen: set[str] = set()
+    url_candidates: list[tuple[str, str]] = []
+    non_url_candidates: list[tuple[str, str]] = []
+
+    for document in documents:
+        for field, value in _collect_search_doc_source_refs(document):
+            if value in seen:
+                continue
+            seen.add(value)
+            if _is_http_url(value):
+                url_candidates.append((field, value))
+            else:
+                non_url_candidates.append((field, value))
+
+    return url_candidates + non_url_candidates
 
 
 def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
@@ -138,6 +178,28 @@ async def _load_full_document_text_for_stage3(
         return None, "Full document text was empty or too short after extraction."
 
     return normalized[:max_chars], None
+
+
+async def _load_full_document_text_from_candidates_for_stage3(
+    source_ref_candidates: list[tuple[str, str]],
+    max_chars: int = STAGE3_FULL_TEXT_MAX_CHARS,
+) -> tuple[str | None, str | None, str | None]:
+    if not source_ref_candidates:
+        return None, "No source reference available in search metadata.", None
+
+    candidate_errors: list[str] = []
+    for field, source_ref in source_ref_candidates:
+        full_document_text, full_document_error = await _load_full_document_text_for_stage3(
+            source_ref,
+            max_chars=max_chars,
+        )
+        if full_document_text:
+            return full_document_text, None, source_ref
+
+        normalized_error = full_document_error or "Unknown full document load failure."
+        candidate_errors.append(f"{field}={source_ref} -> {normalized_error}")
+
+    return None, "All source references failed. " + " | ".join(candidate_errors), None
 
 
 def _normalize_requirement_key(text: str) -> str:
@@ -341,12 +403,49 @@ def _collect_affected_netl_files(
     return sorted(item for item in affected if item)
 
 
+def _build_stage3_seed_documents_by_file(
+    query_results: list[dict[str, object]],
+    supplemental_full_directive_results: list[dict[str, object]],
+    dual_index_enabled: bool,
+) -> dict[str, dict[str, list[dict[str, object]]]]:
+    seed_map: dict[str, dict[str, list[dict[str, object]]]] = {}
+
+    def _bucket(file_name: str) -> dict[str, list[dict[str, object]]]:
+        if file_name not in seed_map:
+            seed_map[file_name] = {
+                "orders_documents": [],
+                "procedures_documents": [],
+                "documents": [],
+            }
+        return seed_map[file_name]
+
+    if dual_index_enabled:
+        for result in query_results + supplemental_full_directive_results:
+            for rank, document in enumerate(result.get("orders_documents", []), start=1):
+                file_name = _extract_search_doc_name(document, rank)
+                if file_name:
+                    _bucket(file_name)["orders_documents"].append(document)
+            for rank, document in enumerate(result.get("procedures_documents", []), start=1):
+                file_name = _extract_search_doc_name(document, rank)
+                if file_name:
+                    _bucket(file_name)["procedures_documents"].append(document)
+    else:
+        for result in query_results + supplemental_full_directive_results:
+            for rank, document in enumerate(result.get("documents", []), start=1):
+                file_name = _extract_search_doc_name(document, rank)
+                if file_name:
+                    _bucket(file_name)["documents"].append(document)
+
+    return seed_map
+
+
 async def _run_file_compliance_stage3(
     config,
     directive_text: str,
     requirements_for_retrieval: list[str],
     affected_files: list[str],
     dual_index_enabled: bool,
+    seed_documents_by_file: dict[str, dict[str, list[dict[str, object]]]] | None = None,
     max_files: int = STAGE3_MAX_FILES,
 ) -> list[dict[str, object]]:
     if not affected_files:
@@ -371,6 +470,7 @@ async def _run_file_compliance_stage3(
         "matched_documents_total": 0,
     }
     _log_stage(3, "Per-file compliance scan")
+    seed_documents_by_file = seed_documents_by_file or {}
 
     for file_name in tqdm(
         files_to_check,
@@ -413,35 +513,43 @@ async def _run_file_compliance_stage3(
                     config,
                     retry_query,
                     index_name=config.search_orders_index_name,
+                    top_n_documents=STAGE3_FILENAME_RETRY_TOP_N,
                 )
                 retry_procedures = await _search_documents(
                     config,
                     retry_query,
                     index_name=config.search_procedures_index_name,
+                    top_n_documents=STAGE3_FILENAME_RETRY_TOP_N,
                 )
                 filtered_orders = _filter_docs_for_file_name(retry_orders, file_name)
                 filtered_procedures = _filter_docs_for_file_name(retry_procedures, file_name)
 
             if not filtered_orders and not filtered_procedures:
-                stage3_stats["no_direct_match"] += 1
+                seed_bucket = seed_documents_by_file.get(file_name, {})
+                seed_orders = _filter_docs_for_file_name(
+                    seed_bucket.get("orders_documents", []),
+                    file_name,
+                )
+                seed_procedures = _filter_docs_for_file_name(
+                    seed_bucket.get("procedures_documents", []),
+                    file_name,
+                )
+                if seed_orders or seed_procedures:
+                    filtered_orders = seed_orders
+                    filtered_procedures = seed_procedures
+                else:
+                    stage3_stats["no_direct_match"] += 1
 
             docs_for_file = filtered_orders + filtered_procedures
             stage3_stats["matched_orders_total"] += len(filtered_orders)
             stage3_stats["matched_procedures_total"] += len(filtered_procedures)
-            source_ref = next(
-                (
-                    _extract_search_doc_source_ref(doc)
-                    for doc in docs_for_file
-                    if _extract_search_doc_source_ref(doc)
-                ),
-                None,
-            )
-            if source_ref:
+            source_ref_candidates = _collect_source_ref_candidates(docs_for_file)
+            if source_ref_candidates:
                 stage3_stats["source_ref_present"] += 1
             else:
                 stage3_stats["source_ref_missing"] += 1
-            full_document_text, full_document_error = await _load_full_document_text_for_stage3(
-                source_ref
+            full_document_text, full_document_error, source_ref = await _load_full_document_text_from_candidates_for_stage3(
+                source_ref_candidates
             )
             if full_document_text:
                 stage3_stats["full_document_loaded"] += 1
@@ -464,27 +572,32 @@ async def _run_file_compliance_stage3(
             filtered_documents = _filter_docs_for_file_name(documents, file_name)
             if not filtered_documents:
                 retry_query = _truncate_for_prompt(file_name, max_chars=240)
-                retry_documents = await _search_documents(config, retry_query)
+                retry_documents = await _search_documents(
+                    config,
+                    retry_query,
+                    top_n_documents=STAGE3_FILENAME_RETRY_TOP_N,
+                )
                 filtered_documents = _filter_docs_for_file_name(retry_documents, file_name)
 
             if not filtered_documents:
-                stage3_stats["no_direct_match"] += 1
+                seed_bucket = seed_documents_by_file.get(file_name, {})
+                seed_documents = _filter_docs_for_file_name(
+                    seed_bucket.get("documents", []),
+                    file_name,
+                )
+                if seed_documents:
+                    filtered_documents = seed_documents
+                else:
+                    stage3_stats["no_direct_match"] += 1
 
             stage3_stats["matched_documents_total"] += len(filtered_documents)
-            source_ref = next(
-                (
-                    _extract_search_doc_source_ref(doc)
-                    for doc in filtered_documents
-                    if _extract_search_doc_source_ref(doc)
-                ),
-                None,
-            )
-            if source_ref:
+            source_ref_candidates = _collect_source_ref_candidates(filtered_documents)
+            if source_ref_candidates:
                 stage3_stats["source_ref_present"] += 1
             else:
                 stage3_stats["source_ref_missing"] += 1
-            full_document_text, full_document_error = await _load_full_document_text_for_stage3(
-                source_ref
+            full_document_text, full_document_error, source_ref = await _load_full_document_text_from_candidates_for_stage3(
+                source_ref_candidates
             )
             if full_document_text:
                 stage3_stats["full_document_loaded"] += 1
@@ -1315,12 +1428,18 @@ async def generate_investigation_artifacts(
             supplemental_full_directive_results=stage2_full_directive_results,
             dual_index_enabled=True,
         )
+        seed_documents_by_file = _build_stage3_seed_documents_by_file(
+            query_results=requirement_query_results,
+            supplemental_full_directive_results=stage2_full_directive_results,
+            dual_index_enabled=True,
+        )
         stage3_file_compliance = await _run_file_compliance_stage3(
             config=config,
             directive_text=directive_text,
             requirements_for_retrieval=requirements_for_retrieval,
             affected_files=affected_files,
             dual_index_enabled=True,
+            seed_documents_by_file=seed_documents_by_file,
             max_files=max_stage3_files,
         )
 
@@ -1370,12 +1489,18 @@ async def generate_investigation_artifacts(
             supplemental_full_directive_results=stage2_full_directive_results,
             dual_index_enabled=False,
         )
+        seed_documents_by_file = _build_stage3_seed_documents_by_file(
+            query_results=requirement_query_results,
+            supplemental_full_directive_results=stage2_full_directive_results,
+            dual_index_enabled=False,
+        )
         stage3_file_compliance = await _run_file_compliance_stage3(
             config=config,
             directive_text=directive_text,
             requirements_for_retrieval=requirements_for_retrieval,
             affected_files=affected_files,
             dual_index_enabled=False,
+            seed_documents_by_file=seed_documents_by_file,
             max_files=max_stage3_files,
         )
 

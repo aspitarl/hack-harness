@@ -1262,6 +1262,7 @@ async def _search_documents(
     config: AppConfig,
     user_query: str,
     index_name: str | None = None,
+    top_n_documents: int | None = None,
 ) -> list[dict[str, object]]:
     """Query Azure AI Search directly and return documents for grounding."""
 
@@ -1277,7 +1278,7 @@ async def _search_documents(
 
     payload: dict[str, object] = {
         "search": user_query,
-        "top": config.search_top_n_documents,
+        "top": top_n_documents if top_n_documents is not None else config.search_top_n_documents,
     }
 
     if config.search_query_type in {"semantic", "simple", "full"}:
